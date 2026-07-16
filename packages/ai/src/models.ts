@@ -310,6 +310,11 @@ export interface CreateProviderOptions<TApi extends Api = Api> {
 	 * `Models.refresh(provider)`), and a later call retries.
 	 */
 	refreshModels?: () => Promise<readonly Model<TApi>[]>;
+
+	// 这个属性存放的才是真正发起模型请求的函数逻辑，它对应于 api 目录下的各类实现。
+	// 它有两种取值：
+	//  - ProviderStreams: 单个 API 的 provider
+	//  - 一个 Record 映射表，key 是 API 名，value 才是 ProviderStreams：表示多个 Provider 的映射表
 	/** Single implementation, or map keyed by `model.api` for mixed-API providers. */
 	api: ProviderStreams | Partial<Record<TApi, ProviderStreams>>;
 }
@@ -324,10 +329,18 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 	let models = input.models;
 	let inflightRefresh: Promise<void> | undefined;
 	const refreshModels = input.refreshModels;
+
+	// 因为 CreateProviderOptions.api 有 ProviderStreams | Partial<Record<TApi, ProviderStreams>> 两种取值
+	// 这里在检查 input.api 是否为 单个Provider（ProviderStreams类型），是则为该 ProviderStreams，否则为 undefined
 	const single =
 		typeof (input.api as ProviderStreams).stream === "function" ? (input.api as ProviderStreams) : undefined;
+	// 这里相当于对 single 取反
 	const byApi = single ? undefined : (input.api as Partial<Record<string, ProviderStreams>>);
 
+	// 情况1：如果是单一 API provider，single 就是唯一的 ProviderStreams 对象。
+	//   ?? 发现它非 null/undefined，直接返回它。所有 model 共用同一个实现。
+	// 情况2：如果是多 API provider，single 是 undefined，
+	//   ?? 短路到右侧。用 model.api（如 "openai-responses" 或 "openai-completions"）作为 key 去映射表里查找对应的 ProviderStreams。
 	const apiFor = (model: Model<Api>): ProviderStreams | undefined => single ?? byApi?.[model.api];
 
 	const dispatch = (
@@ -335,6 +348,8 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		run: (streams: ProviderStreams) => AssistantMessageEventStream,
 	): AssistantMessageEventStream => {
 		const streams = apiFor(model);
+		// 这里做了容错处理，如果调用 apiFor 拿到的 streams 是 undefined（映射表中没有该 API 的条目）
+		// 会生成一个报错信息
 		if (!streams) {
 			return lazyStream(model, async () => {
 				throw new ModelsError("stream", `Provider ${input.id} has no API implementation for "${model.api}"`);
