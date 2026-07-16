@@ -1,0 +1,35 @@
+{
+    "files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/.DS_Store": true,
+        "**/Thumbs.db": true,
+        "**/node_modules": true,
+        ".github": true,
+        ".husky": true,
+        ".pi": true,
+        ".gitattributes": true,
+        "CONTRIBUTING.md": true,
+        "LICENSE": true,
+        "SECURITY.md": true,
+        ".npmrc": true,
+        "biome.json": true,
+        "pi-test.bat": true,
+        "pi-test.ps1": true,
+        "pi-test.sh": true,
+        // "packages/ai": true,
+        // "packages/agent": true,
+        // "packages/coding-agent": true,
+        // "packages/orchestrator": true,
+        // "packages/tui": true,
+    },
+    // 将 TS 执行器改为 tsx
+    "code-runner.executorMap": {
+        "typescript": "tsx"
+    },
+    // 可选：运行时自动聚焦终端输出
+    "code-runner.runInTerminal": true,
+    // 可选：每次运行前保存文件
+    "code-runner.saveFileBeforeRun": true
+}

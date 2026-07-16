@@ -1,3 +1,19 @@
+# 目录
+
+[TOC]
+
+
+# Pi Ai 源码分析
+
+重点看如下几个源码文件就行：
+- index.ts
+- types.ts
+- providers/all.ts
+- providers/deepseek.ts，看一个模型的示例即可
+- api/openai-completions.ts
+
+
+------------------------------------------------------------
 # Pi Agent Core 源码分析
 
 > 分析版本: v0.80.3 | 包名: `@earendil-works/pi-agent-core`
@@ -356,7 +372,7 @@ SessionTreeEntry 类型:
 5. **钩子链**：多个同类型钩子按注册顺序依次执行，后续钩子可覆盖前一个的结果（如 `before_provider_request` 的 streamOptions 合并）。
 
 
-------------
+------------------------------------------------------------
 # Pi Coding Agent 源码分析
 
 > 包名: `@earendil-works/pi-coding-agent` | CLI 命令: `pi`
