@@ -53,6 +53,11 @@ import {
 // OpenAI-completions API 实现（lazy 加载，用于自定义 Provider）
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 
+const OLLAMA_BASE_URL = "http://localhost:11434/v1";
+const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
+const DEEPSEEK_API_KEY = "";
+const USED_MODEL = {provider: "ollama", id: "qwen3.5:8b"};
+// const USED_MODEL = {provider: "deepseek", id: "deepseek-v4-flash"};
 
 /**
  * pi-ai 中对模型的抽象分为 3 个层次：
@@ -211,8 +216,8 @@ function showModelsUtilFunctionUsage() {
  * 不过有一点，Provider接口里，只有一个返回所有模型的 getModels() 方法，不能按照模型名称进行准确查询，
  * 所以还是建议将其注册到 Models 里。
  */
-function showProviderUsage() {
-  console.log("---------- showProviderUsage ----------")
+function showCreateProviderUsage() {
+  console.log("---------- showCreateProviderUsage ----------")
 
   console.log("\n========== 示例1: 静态 Ollama Provider ==========");
 
@@ -221,7 +226,7 @@ function showProviderUsage() {
   const options: CreateProviderOptions<Api> = {
     id: 'ollama',
     name: 'Ollama',
-    baseUrl: 'http://localhost:11434/v1',
+    baseUrl: OLLAMA_BASE_URL,
     // 认证：本地服务无需 key，但每个 Provider 必须有 auth 声明
     // resolve 返回 { auth: {} } 表示"已配置但无需 key"
     auth: {
@@ -237,7 +242,7 @@ function showProviderUsage() {
         name: 'Llama 3.1 8B (Ollama)',
         api: 'openai-completions',
         provider: 'ollama',
-        baseUrl: 'http://localhost:11434/v1',
+        baseUrl: OLLAMA_BASE_URL,
         reasoning: false,
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -276,7 +281,7 @@ function showProviderUsage() {
     name: 'Qwen3 14B (Ollama)',
     api: 'openai-completions',
     provider: 'ollama',
-    baseUrl: 'http://localhost:11434/v1',
+    baseUrl: OLLAMA_BASE_URL,
     reasoning: true,
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -303,22 +308,23 @@ function showProviderUsage() {
 }
 
 /**
- * 工具函数：创建注册了 Ollama Provider 的 Models 集合，供后续示例使用。
- * 
+ * 工具函数：创建注册了 自定义 Provider 的 Models 集合，供后续示例使用。
  * 返回 MutableModels，可以通过 getModel() 按名称精确查找模型。
- * 使用前确保本地 Ollama 服务已启动（默认 http://localhost:11434）。
- * 
+ * 如果使用Ollama模型，使用前确保本地 Ollama 服务已启动（默认 http://localhost:11434）。
  * 注册的模型：
  *   - qwen3:8b     — 基础对话模型，无推理能力
  *   - qwen3.5:9b   — 推理模型，reasoning: true
+ *   - deepseek-v4-pro
+ *   - deepseek-v4-flash
  */
-function getOllamaModels(): MutableModels {
+function getCustomModels(): MutableModels {
   const models = createModels();
 
+  // Ollama模型Provider
   const ollamaOptions: CreateProviderOptions<Api> = {
       id: 'ollama',
       name: 'Ollama',
-      baseUrl: 'http://localhost:11434/v1',
+      baseUrl: OLLAMA_BASE_URL,
       // 本地服务无需 API key，但必须声明 auth
       auth: {
         apiKey: {
@@ -333,7 +339,7 @@ function getOllamaModels(): MutableModels {
           name: 'Qwen3 8B (Ollama)',
           api: 'openai-completions',
           provider: 'ollama',
-          baseUrl: 'http://localhost:11434/v1',
+          baseUrl: OLLAMA_BASE_URL,
           reasoning: false,
           input: ['text'],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -345,7 +351,7 @@ function getOllamaModels(): MutableModels {
           name: 'Qwen3.5 9B (Ollama)',
           api: 'openai-completions',
           provider: 'ollama',
-          baseUrl: 'http://localhost:11434/v1',
+          baseUrl: OLLAMA_BASE_URL,
           reasoning: true,
           input: ['text'],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -362,7 +368,58 @@ function getOllamaModels(): MutableModels {
     }
   const ollamaProvider: Provider<Api> = createProvider(ollamaOptions);
 
+  // DeepSeek 模型 Provider（非官方）
+  const deepseekOptions: CreateProviderOptions<Api> = {
+      id: "deepseek",
+      name: "DeepSeek",
+      baseUrl: DEEPSEEK_BASE_URL,
+      auth: { apiKey: envApiKeyAuth("DeepSeek API key", ["DEEPSEEK_API_KEY"]) },
+      models: [
+        {
+          id: "deepseek-v4-flash",
+          name: "DeepSeek V4 Flash",
+          api: "openai-completions",
+          provider: "deepseek",
+          baseUrl: DEEPSEEK_BASE_URL,
+          compat: {"supportsStore":false,"supportsDeveloperRole":false,"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"deepseek"},
+          reasoning: true,
+          thinkingLevelMap: {"minimal":null,"low":null,"medium":null,"high":"high","xhigh":"max"},
+          input: ["text"],
+          cost: {
+            input: 0.14,
+            output: 0.28,
+            cacheRead: 0.0028,
+            cacheWrite: 0,
+          },
+          contextWindow: 1000000,
+          maxTokens: 384000,
+        } satisfies Model<"openai-completions">,
+        {
+          id: "deepseek-v4-pro",
+          name: "DeepSeek V4 Pro",
+          api: "openai-completions",
+          provider: "deepseek",
+          baseUrl: DEEPSEEK_BASE_URL,
+          compat: {"supportsStore":false,"supportsDeveloperRole":false,"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"deepseek"},
+          reasoning: true,
+          thinkingLevelMap: {"minimal":null,"low":null,"medium":null,"high":"high","xhigh":"max"},
+          input: ["text"],
+          cost: {
+            input: 0.435,
+            output: 0.87,
+            cacheRead: 0.003625,
+            cacheWrite: 0,
+          },
+          contextWindow: 1000000,
+          maxTokens: 384000,
+        } satisfies Model<"openai-completions">,
+      ],
+      api: openAICompletionsApi(),
+    };
+  const deepseekProvider: Provider<Api> = createProvider(ollamaOptions);
+
   models.setProvider(ollamaProvider);
+  models.setProvider(deepseekProvider);
   return models;
 }
 
@@ -380,12 +437,12 @@ function getOllamaModels(): MutableModels {
 async function showModelUsage(): Promise<void> {
   console.log("---------- showModelUsage ----------")
 
-  const ollamaModels = getOllamaModels();
+  const customModels = getCustomModels();
 
   // 通过 getModel() 按名称精确查找模型
-  const ollamaModel = ollamaModels.getModel('ollama', 'qwen3:8b');
-  if (!ollamaModel) {
-    console.error("Model 'qwen3:8b' not found in Ollama provider");
+  const model = customModels.getModel(USED_MODEL.provider, USED_MODEL.id);
+  if (!model) {
+    console.error(`"Model '${USED_MODEL.id}' not found in provider '${USED_MODEL.provider}'"`);
     return;
   }
 
@@ -399,7 +456,7 @@ async function showModelUsage(): Promise<void> {
 
   // ===== 方式1: 流式调用 stream() =====
   // stream() 返回 AssistantMessageEventStream，是一个 AsyncIterable
-  const s: AssistantMessageEventStream = ollamaModels.stream(ollamaModel, context);
+  const s: AssistantMessageEventStream = customModels.stream(model, context);
 
   console.log("\n\n>>> Stream Chat with Ollama Model:\n");
   for await (const event of s) {
@@ -476,7 +533,7 @@ async function showModelUsage(): Promise<void> {
     content: "再用一句话总结你刚才说的话",
     timestamp: Date.now(),
   });
-  const response = await ollamaModels.complete(ollamaModel, context);
+  const response = await customModels.complete(model, context);
   console.log("\n\n>>> Complete (non-streaming):");
   for (const block of response.content) {
     if (block.type === "text") {
@@ -486,7 +543,7 @@ async function showModelUsage(): Promise<void> {
     }
   }
   // 使用 calculateCost 手动计算费用
-  const cost = calculateCost(ollamaModel, response.usage);
+  const cost = calculateCost(model, response.usage);
   console.log(`Calculated cost: $${cost.total.toFixed(6)}`);
 
   console.log("\n========== 方式3: 使用 abort 中止请求 ==========");
@@ -495,8 +552,8 @@ async function showModelUsage(): Promise<void> {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), 1000); // 1秒后中止
 
-  const abortStream = ollamaModels.stream(
-    ollamaModel, 
+  const abortStream = customModels.stream(
+    model, 
     {
       messages: [{ role: "user", content: "请写一篇很长的文章", timestamp: Date.now() }],
     }, 
@@ -534,10 +591,10 @@ async function showModelUsage(): Promise<void> {
 async function showToolCallingUsage() {
   console.log("---------- showToolCallingUsage ----------")
 
-  const ollamaModels = getOllamaModels();
-  const ollamaModel = ollamaModels.getModel('ollama', 'qwen3:8b');
-  if (!ollamaModel) {
-    console.error("Model 'qwen3:8b' not found in Ollama provider");
+  const customModels = getCustomModels();
+  const model = customModels.getModel(USED_MODEL.provider, USED_MODEL.id);
+  if (!model) {
+    console.error(`"Model '${USED_MODEL.id}' not found in provider '${USED_MODEL.provider}'"`);
     return;
   }
 
@@ -583,7 +640,7 @@ async function showToolCallingUsage() {
   };
 
   // 3. 使用 complete() 获取完整响应（非流式，适合工具调用场景）
-  const response = await ollamaModels.complete(ollamaModel, context);
+  const response = await customModels.complete(model, context);
   console.log(`\n>>> Stop reason: ${response.stopReason}`);
   console.log(">>> Response content blocks:");
   for (const block of response.content) {
@@ -658,7 +715,7 @@ async function showToolCallingUsage() {
 
   // 6. 如果有工具调用，让模型基于工具结果继续生成回复
   if (toolCalls.length > 0) {
-    const continuation = await ollamaModels.complete(ollamaModel, context);
+    const continuation = await customModels.complete(model, context);
     context.messages.push(continuation);
     console.log("\n>>> After tool execution:");
     for (const block of continuation.content) {
@@ -695,9 +752,12 @@ async function showToolCallingUsage() {
 async function showErrorHandlingUsage() {
   console.log("---------- showErrorHandlingUsage ----------")
 
-  const ollamaModels = getOllamaModels();
-  const ollamaModel = ollamaModels.getModel('ollama', 'qwen3:8b');
-  if (!ollamaModel) return;
+  const customModels = getCustomModels();
+  const model = customModels.getModel(USED_MODEL.provider, USED_MODEL.id);
+  if (!model) {
+    console.error(`"Model '${USED_MODEL.id}' not found in provider '${USED_MODEL.provider}'"`);
+    return;
+  }
 
   console.log("\n========== 场景1: 流式请求中的错误处理 ==========");
 
@@ -706,7 +766,7 @@ async function showErrorHandlingUsage() {
     messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
   };
 
-  const s = ollamaModels.stream(ollamaModel, context);
+  const s = customModels.stream(model, context);
   for await (const event of s) {
     if (event.type === "error") {
       // event.reason: "error"（网络/认证等错误）或 "aborted"（主动取消）
@@ -723,13 +783,13 @@ async function showErrorHandlingUsage() {
     // 即使失败，message 也可以被加入上下文继续对话
     // context.messages.push(message);
     // context.messages.push({ role: "user", content: "Please continue", timestamp: Date.now() });
-    // await ollamaModels.complete(ollamaModel, context);
+    // await customModels.complete(model, context);
   }
 
   console.log("\n========== 场景2: complete() 直接检查 stopReason ==========");
 
   // ===== 场景2: complete() 直接检查 stopReason =====
-  const response = await ollamaModels.complete(ollamaModel, context);
+  const response = await customModels.complete(model, context);
   if (response.stopReason === "error") {
     console.error(`Complete failed: ${response.errorMessage}`);
   } else if (response.stopReason === "length") {
@@ -741,7 +801,7 @@ async function showErrorHandlingUsage() {
   console.log("\n========== 场景3: 使用 onPayload / onResponse 调试请求 ==========");
 
   // ===== 场景3: 使用 onPayload / onResponse 调试请求 =====
-  await ollamaModels.complete(ollamaModel, context, {
+  await customModels.complete(model, context, {
     onPayload: (payload: unknown) => {
       // 在发送前检查/修改请求负载
       console.log("Request payload:", JSON.stringify(payload).substring(0, 200) + "...");
@@ -770,9 +830,9 @@ async function showErrorHandlingUsage() {
 async function showThinkingUsage() {
   console.log("---------- showThinkingUsage ----------")
 
-  const ollamaModels = getOllamaModels();
+  const customModels = getCustomModels();
   // 通过 getModel() 按名称精确查找推理模型
-  const reasoningModel = ollamaModels.getModel('ollama', 'qwen3.5:9b');
+  const reasoningModel = customModels.getModel('ollama', 'qwen3.5:9b');
   if (!reasoningModel) {
     console.log("No reasoning model available (qwen3.5:9b not found)");
     return;
@@ -797,7 +857,7 @@ async function showThinkingUsage() {
   console.log("\n========== completeSimple：统一推理参数 ==========");
 
   // ===== 使用 completeSimple + 统一 reasoning 参数 =====
-  const response = await ollamaModels.completeSimple(reasoningModel, context, {
+  const response = await customModels.completeSimple(reasoningModel, context, {
     reasoning: 'medium', // 统一推理级别，pi 自动转换为 Provider 原生参数
   });
 
@@ -815,7 +875,7 @@ async function showThinkingUsage() {
   console.log("\n========== streamSimple：流式推理 ==========");
 
   // ===== 流式推理：streamSimple =====
-  const s = ollamaModels.streamSimple(reasoningModel, context, { reasoning: 'high' });
+  const s = customModels.streamSimple(reasoningModel, context, { reasoning: 'high' });
   for await (const event of s) {
     switch (event.type) {
       case "thinking_start":
@@ -1095,7 +1155,7 @@ function showCredentialStoreUsage() {
 async function main() {
   showModelsUsage();
   showModelsUtilFunctionUsage();
-  showProviderUsage();
+  showCreateProviderUsage();
   // showContextSerializationUsage();
   // showCredentialStoreUsage();
   // 以下函数需要真实 API 连接：
