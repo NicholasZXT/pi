@@ -79,13 +79,13 @@ function showModelsUsage() {
   console.log("\n========== 创建 Models 并注册 Provider ==========");
 
   // 1. 使用 createModels 创建一个空的 Models 注册对象
-  const models = createModels();
+  const models: MutableModels = createModels();
   // 2. 手动注册需要的 Provider
   models.setProvider(deepseekProvider());
   models.setProvider(openaiProvider());
 
   // 也可以直接使用注册了所有内置模型提供商的 Models
-  const modelsAll = builtinModels(); 
+  const modelsAll: MutableModels = builtinModels(); 
 
   console.log("\n========== 查询 Provider / Model ==========");
 
@@ -159,14 +159,14 @@ function showModelsUtilFunctionUsage() {
   console.log("\n========== builtinProviders / getBuiltinProviders ==========");
 
   // 获取所有内置 Provider（可用于自行注册到 createModels() 中）
-  const allProviders = builtinProviders();
+  const allProviders: Provider<Api>[] = builtinProviders();
   console.log(`Builtin providers count: ${allProviders.length}`);
   for (const p of allProviders) {
     console.log(`  - ${p.id}: ${p.name}`);
   }
 
   // 获取所有内置 Provider 名称（字符串数组）
-  const providerNames = getBuiltinProviders();
+  const providerNames: string[] = getBuiltinProviders();
   console.log(`Provider names: ${providerNames.join(', ')}`);
 
   console.log("\n========== getBuiltinModels ==========");
@@ -217,7 +217,8 @@ function showProviderUsage() {
   console.log("\n========== 示例1: 静态 Ollama Provider ==========");
 
   // ===== 示例1: 创建静态模型列表的 Ollama Provider =====
-  const ollamaProvider = createProvider({
+  // 先配置 Provider 的options
+  const options: CreateProviderOptions<Api> = {
     id: 'ollama',
     name: 'Ollama',
     baseUrl: 'http://localhost:11434/v1',
@@ -246,7 +247,9 @@ function showProviderUsage() {
     ],
     // OpenAI 兼容 API 实现
     api: openAICompletionsApi(),
-  });
+  }
+  // 调用 createProvider() 函数创建
+  const ollamaProvider = createProvider(options);
 
   console.log("\n========== 示例2: 使用 envApiKeyAuth 的动态 Provider ==========");
 
@@ -311,8 +314,8 @@ function showProviderUsage() {
  */
 function getOllamaModels(): MutableModels {
   const models = createModels();
-  models.setProvider(
-    createProvider({
+
+  const ollamaOptions: CreateProviderOptions<Api> = {
       id: 'ollama',
       name: 'Ollama',
       baseUrl: 'http://localhost:11434/v1',
@@ -356,8 +359,10 @@ function getOllamaModels(): MutableModels {
         },
       ],
       api: openAICompletionsApi(),
-    }),
-  );
+    }
+  const ollamaProvider: Provider<Api> = createProvider(ollamaOptions);
+
+  models.setProvider(ollamaProvider);
   return models;
 }
 
@@ -490,9 +495,13 @@ async function showModelUsage(): Promise<void> {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), 1000); // 1秒后中止
 
-  const abortStream = ollamaModels.stream(ollamaModel, {
-    messages: [{ role: "user", content: "请写一篇很长的文章", timestamp: Date.now() }],
-  }, { signal: controller.signal });
+  const abortStream = ollamaModels.stream(
+    ollamaModel, 
+    {
+      messages: [{ role: "user", content: "请写一篇很长的文章", timestamp: Date.now() }],
+    }, 
+    { signal: controller.signal }
+  );
 
   for await (const event of abortStream) {
     if (event.type === "text_delta") {
