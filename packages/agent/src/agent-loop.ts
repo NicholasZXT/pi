@@ -92,6 +92,16 @@ export function agentLoopContinue(
 	return stream;
 }
 
+/**
+ * pi-agent-core底层 AgentLoop 的主入口函数
+ * @param prompts
+ * @param context
+ * @param config
+ * @param emit
+ * @param signal
+ * @param streamFn
+ * @returns
+ */
 export async function runAgentLoop(
 	prompts: AgentMessage[],
 	context: AgentContext,
@@ -106,6 +116,8 @@ export async function runAgentLoop(
 		messages: [...context.messages, ...prompts],
 	};
 
+	// 这里调用并异步等待部分 hook 方法执行完。
+	// emit 一般对应的就是 agent.ts 里 Agent.processEvents(signal) 方法。
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
 	for (const prompt of prompts) {
@@ -113,6 +125,7 @@ export async function runAgentLoop(
 		await emit({ type: "message_end", message: prompt });
 	}
 
+	// 实际的 AgentLoop 逻辑在这里
 	await runLoop(currentContext, newMessages, config, signal, emit, streamFn);
 	return newMessages;
 }
@@ -155,6 +168,7 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 async function runLoop(
 	initialContext: AgentContext,
 	newMessages: AgentMessage[],
+	// 看下面的源码实现逻辑，这个配置对象很重要，不仅有静态配置，还有动态方法
 	initialConfig: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
@@ -164,12 +178,19 @@ async function runLoop(
 	let config = initialConfig;
 	let firstTurn = true;
 	// Check for steering messages at start (user may have typed while waiting)
+	// steering messages 如果有的话，在执行之前就会被获取
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
+	// -------------------------------- Agent双层循环 ----------------------------------------------
+	// 它由两层循环构成：
+	// - 外层循环：处理队列里排队等候的 follow-up 消息，注意，它不是处理当前输入的消息，而是处理补充输入的消息
+	// - 内层循环：处理当前轮次的消息，这个循环才是通常意义上的 AgentLoop
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
 
+		// 这个循环才是处理 当前会话 + 工具调用
+		// 另外这个循环里还对 steering messages 进行了检查处理
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
 			if (!firstTurn) {
@@ -178,6 +199,7 @@ async function runLoop(
 				firstTurn = false;
 			}
 
+			// pending messages 来自于 steering queue，可以看出该队列的消息在调用LLM之前就会被注入到上下文 ----- KEY
 			// Process pending messages (inject before next assistant response)
 			if (pendingMessages.length > 0) {
 				for (const message of pendingMessages) {
@@ -186,9 +208,11 @@ async function runLoop(
 					currentContext.messages.push(message);
 					newMessages.push(message);
 				}
+				// 将pendingMessages 里的消息遍历加入到 newMessages 后，需要重置内层 while 循环的判断条件之一。
 				pendingMessages = [];
 			}
 
+			// 触发对模型服务的流式请求
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
@@ -201,22 +225,32 @@ async function runLoop(
 
 			// Check for tool calls
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
-
 			const toolResults: ToolResultMessage[] = [];
+
+			// 处理完本轮的ToolCalls，需要重置内层 while 循环的判断条件之一。
 			hasMoreToolCalls = false;
+
 			if (toolCalls.length > 0) {
+				// 执行工具调用，根据config.toolExecution，会决定是并行调用还是串行调用。
 				const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
+
+				// 收集返回的工具调用信息
 				toolResults.push(...executedToolBatch.messages);
+
+				// 这里还根据工具调用结果进行了一次判断
 				hasMoreToolCalls = !executedToolBatch.terminate;
 
+				// 将工具调用结果加入messages列表和上下文
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}
 			}
 
+			// 当前轮次结束，调用hook函数
 			await emit({ type: "turn_end", message, toolResults });
 
+			// 准备下一轮的Context
 			const nextTurnContext = {
 				message,
 				toolResults,
@@ -238,6 +272,8 @@ async function runLoop(
 				};
 			}
 
+			// 是否结束本轮调用，还需要调用 AgentLoopConfig.shouldStopAfterTurn() 方法进行判断
+			// 如果该方法返回 true，则直接结束调用；否则继续执行
 			if (
 				await config.shouldStopAfterTurn?.({
 					message,
@@ -250,8 +286,11 @@ async function runLoop(
 				return;
 			}
 
+			// 再检查一次 steering message，如果还有，那么内层 while 循环会继续
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			// 如果没有 steering message，并且上面也没有更多的工具调用了，内层 while 循环判断条件为false，在此之后就结束了。
 		}
+		// -------------- 内层 while 循环结束 ---------------
 
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
@@ -264,6 +303,7 @@ async function runLoop(
 		// No more messages, exit
 		break;
 	}
+	// ---------- 外层 while 循环结束 ----------
 
 	await emit({ type: "agent_end", messages: newMessages });
 }

@@ -159,6 +159,8 @@ class PendingMessageQueue {
 type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;
+	// 这个是 Node.js 底层运行时提供的管理异步生命周期的基础设施，
+	// 它提供了一种标准化的信号机制，允许在代码的任何位置优雅地终止正在进行的任务。
 	abortController: AbortController;
 };
 
@@ -167,10 +169,16 @@ type ActiveRun = {
  *
  * `Agent` owns the current transcript, emits lifecycle events, executes tools,
  * and exposes queueing APIs for steering and follow-up messages.
+ *
+ * 这个 Agent 实现（包括底层的 agent-loop.ts 里的 runAgentLoop + runLoop）并不复杂，逻辑值得一看。
  */
 export class Agent {
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
+
+	// 两个消息队列：
+	// - SteeringQueue：AgentLoop 每轮执行之初（调用LLM之前）就会加入到上下文的消息 —— 用于实时干预
+	// - followUpQueue：AgentLoop 执行完，停止之前才追加的上下文消息 —— 用于追加任务
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
 
@@ -195,7 +203,15 @@ export class Agent {
 		context: PrepareNextTurnContext,
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+
+	/**
+	 * 用于标识Agent当前是否有运行实例的属性，它的值变化如下：
+	 * - 一开始为 undefined
+	 * - prompt方法开始执行，在 runWithLifecycle() 方法中首次初始化
+	 * - 执行结束后，在 finishRun() 方法中被重置为 undefined
+	 */
 	private activeRun?: ActiveRun;
+
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -240,6 +256,8 @@ export class Agent {
 	 */
 	subscribe(listener: (event: AgentEvent, signal: AbortSignal) => Promise<void> | void): () => void {
 		this.listeners.add(listener);
+		// 注意，subscribe 返回了一个箭头函数的引用，
+		// 可以通过该引用调用此箭头函数，实现 unsubstribe() 该 listener 的效果。
 		return () => this.listeners.delete(listener);
 	}
 
@@ -398,10 +416,13 @@ export class Agent {
 		options: { skipInitialSteeringPoll?: boolean } = {},
 	): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
+			// 这里实际的 AgentLoop 执行调用的是 agent-loop.ts 里提供的函数 ----------------- KEY
 			await runAgentLoop(
 				messages,
 				this.createContextSnapshot(),
+				// 这里装配了 AgentLoopConfig 配置，这个配置也很重要，需要留意 ------- KEY
 				this.createLoopConfig(options),
+				// 这个是处理各个时间点 hook 的回调函数。
 				(event) => this.processEvents(event),
 				signal,
 				this.streamFn,
@@ -429,6 +450,11 @@ export class Agent {
 		};
 	}
 
+	/**
+	 * 此方法用于组装调用 atent-loop.ts 里 runAgentLoop 里的 config 配置，需要留意。
+	 * @param options
+	 * @returns
+	 */
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
 		return {
@@ -476,6 +502,8 @@ export class Agent {
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
+
+		// 只有这里会设置 activeRun ---------- KEY
 		this.activeRun = { promise, resolve: resolvePromise, abortController };
 
 		this._state.isStreaming = true;
@@ -483,6 +511,7 @@ export class Agent {
 		this._state.errorMessage = undefined;
 
 		try {
+			// 这个传入的 executor 里面会调用 agent-loop.ts 里提供的 runAgentLoop() 函数 ------------------- KEY
 			await executor(abortController.signal);
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted);
@@ -568,6 +597,7 @@ export class Agent {
 		if (!signal) {
 			throw new Error("Agent listener invoked outside active run");
 		}
+		// 遍历调用注册的所有 hook 方法，this.listeners 列表由 subscribe() 方法注册各种 hook 方法。
 		for (const listener of this.listeners) {
 			await listener(event, signal);
 		}
