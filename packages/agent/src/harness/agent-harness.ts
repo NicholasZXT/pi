@@ -163,7 +163,13 @@ export class AgentHarness<
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
 	TTool extends AgentTool = AgentTool,
 > {
-	// 执行环境封装
+	/**
+	 * 	执行环境封装。
+	 * 就目前版本的实现来说，此处的 ExecutionEnv 对象并没有任何作用，
+	 * 它不参与工具调用、会话压缩、分支导航等任何流程，也不被 runAgentLoop 使用。
+	 * 除了被 harness 包中的 loadSkills() / loadSourcesSkills() / executeShellWithCapture() 使用。
+	 * 可能是留给工具实现者和 systemPrompt 回调的外部能力抽象。
+	 */
 	readonly env: ExecutionEnv;
 	// Session对象
 	private session: Session;
