@@ -318,17 +318,28 @@ export class AgentHarness<
 	}
 
 	/**
-	 * 每轮对话开始时构建当前轮次的 context state
+	 * 每轮对话开始时构建当前轮次的 **历史 context state**。
+	 * 这个方法非常重要，参见它内部调用的 this.session.buildContext() 说明。
+	 * 
+	 * 不过这里返回的 Context state 只包含：
+	 * - 重建的历史会话
+	 * - Skills / PromptTemplates 资源
+	 * - 系统提示词
+	 * 不包括当前轮次用户输入的 Message
 	 * @returns 
 	 */
 	private async createTurnState(): Promise<AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>> {
-		// 构建当前上下文
+		/**
+		 * 构建历史会话上下文 -------------------------------------------------------------- KEY
+		 * 这个方法很重要，它不仅负责会话初始时的上下文构建过程，
+		 * Agent执行了会话跳转、会话压缩、分支跳转的操作之后，历史会话的清理、重建过程也在这里执行。
+		 */
 		const context = await this.session.buildContext();
+
 		// 加载 skills / prompts 等资源
 		const resources = this.getResources();
 		// 获取当前session的元数据
 		const sessionMetadata = await this.session.getMetadata();
-
 		// 获取可使用的工具描述 + 当前活跃的工具描述
 		const tools = [...this.tools.values()];
 		const activeTools = this.activeToolNames
@@ -560,9 +571,12 @@ export class AgentHarness<
 		text: string,
 		options?: { images?: ImageContent[] },
 	): Promise<AssistantMessage> {
+		// 这个 turnState 由 createTurnState() 方法返回
 		let activeTurnState = turnState;
+		// 上面的 turnState 不包含用户本次输入的 message，也不包括两个 queue 里的消息
 		let messages: AgentMessage[] = [createUserMessage(text, options?.images)];
 		if (this.nextTurnQueue.length > 0) {
+			// 使用splice(0) 清空 nextTurnQueue 数组内容，并返回原始数组的内容
 			const queuedMessages = this.nextTurnQueue.splice(0);
 			try {
 				await this.emitQueueUpdate();
@@ -570,6 +584,7 @@ export class AgentHarness<
 				this.nextTurnQueue.unshift(...queuedMessages);
 				throw normalizeHookError(error);
 			}
+			// 创建一个新数组，解包 queueMessages，并尾部追加 messages 里的第一条消息（实际也就一条消息）
 			messages = [...queuedMessages, messages[0]!];
 		}
 		const beforeResult = await this.emitHook({
@@ -579,6 +594,7 @@ export class AgentHarness<
 			systemPrompt: turnState.systemPrompt,
 			resources: turnState.resources,
 		});
+		// 如果 hook 方法也返回了消息，则追加到末尾
 		if (beforeResult?.messages) messages = [...messages, ...beforeResult.messages];
 
 		const abortController = new AbortController();
@@ -593,7 +609,11 @@ export class AgentHarness<
 			try {
 				// 直接调用底层 agent-loop.ts 的 runAgentLoop() 方法 ---------------------------- KEY
 				return await runAgentLoop(
+					// 这个 messages 只包含了用户本次输入消息 + queuedMessages + 可能的hook message
+					// 不包含历史消息 / Skills / PromptTemplates / SystemtPrompt
 					messages,
+					// 这里只是简单的做了一个转换，转成 AgentContext 结构，
+					// 这里包含历史消息 + Skill + PromptTemplates + SystemtPrompt
 					this.createContext(turnState, beforeResult?.systemPrompt),
 					this.createLoopConfig(getTurnState, setTurnState),
 					(event) => this.handleAgentEvent(event, abortController.signal),
@@ -716,6 +736,11 @@ export class AgentHarness<
 		}
 	}
 
+	/**
+	 * 会话压缩
+	 * @param customInstructions 
+	 * @returns 
+	 */
 	async compact(
 		customInstructions?: string,
 	): Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown }> {
@@ -724,11 +749,14 @@ export class AgentHarness<
 		try {
 			const model = this.model;
 			if (!model) throw new AgentHarnessError("invalid_state", "No model set for compaction");
+			// 从 session 中查询获取当前分支的历史会话 Entry paths
 			const branchEntries = await this.session.getBranch();
+			// 执行会话压缩前的一些准备工作，比如计算会话的范围等
 			const preparationResult = prepareCompaction(branchEntries, DEFAULT_COMPACTION_SETTINGS);
 			if (!preparationResult.ok) throw preparationResult.error;
 			const preparation = preparationResult.value;
 			if (!preparation) throw new AgentHarnessError("compaction", "Nothing to compact");
+			// 注册的 Hook 方法中，可能会有提前执行会话压缩的逻辑
 			const hookResult = await this.emitHook({
 				type: "session_before_compact",
 				preparation,
@@ -738,18 +766,23 @@ export class AgentHarness<
 			});
 			if (hookResult?.cancel) throw new AgentHarnessError("compaction", "Compaction cancelled");
 			const provided = hookResult?.compaction;
+			// 这里（可能）调用 compact() 函数执行会话压缩操作 ------------------------------ KEY
 			const compactResult = provided
 				? { ok: true as const, value: provided }
 				: await compact(preparation, this.models, model, customInstructions, undefined, this.thinkingLevel);
 			if (!compactResult.ok) throw compactResult.error;
 			const result = compactResult.value;
+			// 注意，这里只是向 session 中追加了一条 会话压缩操作的记录，会话压缩的操作不是由 session 执行的。
 			const entryId = await this.session.appendCompaction(
+				// 这个 summary 就是压缩后的会话
 				result.summary,
 				result.firstKeptEntryId,
 				result.tokensBefore,
 				result.details,
 				provided !== undefined,
 			);
+			// 但是压缩会话后，之前的历史会话并没有从session中清除 ！
+			// 这一操作并不是在这里执行的，而是被分离并推迟到 createTurnState() 方法里了 -------------------------- KEY
 			const entry = await this.session.getEntry(entryId);
 			if (entry?.type === "compaction") {
 				await this.emitOwn({ type: "session_compact", compactionEntry: entry, fromHook: provided !== undefined });
@@ -762,6 +795,14 @@ export class AgentHarness<
 		}
 	}
 
+	/**
+	 * 会话分支跳转。
+	 * 注意，此方法的实现中，只是向 session 中追加了一条 分支跳转记录，并没有实际执行分支跳转后的会话重建操作。
+	 * 会话重建操作是在 createTurnState() 方法中完成的 ！！！
+	 * @param targetId 
+	 * @param options 
+	 * @returns 
+	 */
 	async navigateTree(
 		targetId: string,
 		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
@@ -769,10 +810,16 @@ export class AgentHarness<
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "navigateTree() requires idle harness");
 		this.phase = "branch_summary";
 		try {
+			// 获取当前会话所处于的叶子节点ID
 			const oldLeafId = await this.session.getLeafId();
+			// 如果就是要跳转的Entry，就直接返回
 			if (oldLeafId === targetId) return { cancelled: false };
+			// 从 session 获取待跳转的目标 Entry
 			const targetEntry = await this.session.getEntry(targetId);
 			if (!targetEntry) throw new AgentHarnessError("invalid_argument", `Entry ${targetId} not found`);
+
+			// 下面这个方法会收集 oldLeafId 和 targetId 各自的会话 paths 中公共 paths 的 Entry 记录，并返回公共的祖先节点Id
+			// 主要是为了后续 hook 方法收集信息，并生成可选的分支摘要使用
 			const { entries, commonAncestorId } = await collectEntriesForBranchSummary(this.session, oldLeafId, targetId);
 			const preparation = {
 				targetId,
@@ -810,6 +857,7 @@ export class AgentHarness<
 					modifiedFiles: branchSummary.value.modifiedFiles,
 				};
 			}
+			// 生成 editorText
 			let editorText: string | undefined;
 			let newLeafId: string | null;
 			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
@@ -834,6 +882,7 @@ export class AgentHarness<
 			} else {
 				newLeafId = targetId;
 			}
+			// 注意，这里调用的 session.moveTo() 方法只是记录了一次分支跳转事件，并没有执行分支会话的重建操作 ------------- KEY
 			const summaryId = await this.session.moveTo(
 				newLeafId,
 				summaryText
@@ -851,6 +900,8 @@ export class AgentHarness<
 				summaryEntry,
 				fromHook: hookResult?.summary !== undefined,
 			});
+			// 直到调用结束，都没有实际执行分支会话构建的操作
+			// 实际上这个过程被分离并推迟到 createTurnState() 方法里了 -------------------------- KEY
 			return { cancelled: false, editorText, summaryEntry };
 		} catch (error) {
 			throw normalizeHarnessError(error, "branch_summary");
@@ -1033,6 +1084,12 @@ export class AgentHarness<
 		await this.runPromise;
 	}
 
+	/**
+	 * 注册指定事件的回调 Listener 函数。
+	 * 只能作为事件的监听者，无法干预Agent执行流程。
+	 * @param listener 
+	 * @returns 
+	 */
 	subscribe(
 		listener: (event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal) => Promise<void> | void,
 	): () => void {
@@ -1045,6 +1102,12 @@ export class AgentHarness<
 		return () => handlers!.delete(listener as AgentHarnessHandler);
 	}
 
+	/**
+	 * 监听特定类型的 Harness 自有事件，可以注册对应的 handler 干预 Agent 执行行为。
+	 * @param type 
+	 * @param handler 
+	 * @returns 
+	 */
 	on<TType extends keyof AgentHarnessEventResultMap>(
 		type: TType,
 		handler: (

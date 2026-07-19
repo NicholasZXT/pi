@@ -473,6 +473,207 @@ SessionTreeEntry 类型:
 
 ## 五、组件细节讨论
 
+### 5.1 Session设计
+
+#### 1. Session 设计思路
+
+Session 子系统是 `AgentHarness` 的持久化基础设施，核心设计遵循以下原则：
+
+（1）**树形会话结构**：
+
+- Session 采用树形结构，每个条目（`SessionTreeEntry`）通过 `parentId` 链接到父节点。
+- 当前分支位置通过 `leaf` 条目（`LeafEntry`，含 `targetId`）持久化记录，而非纯内存游标。
+- 这意味着重新打开存储时必须从最新的 leaf-affecting entry 重建当前叶子位置。
+
+> 源码里逻辑上它存储的是树形结构的会话条目，但是物理存储（数据结构）上，并没有使用传统的二叉树或者树形数据结构，而是通过一个Map (byId属性) + 数组entries + 每个SessionTreeEntry 内部的 parentID引用机制实现的树形逻辑结构。
+
+（2）**持久化历史消息 + 操作行为** - KEY
+
+树形结构的会话条目 `SessionTreeEntry` 是一个**联合类型**，说明SessionStorage中存储的会话历史记录里，不仅是对话历史Messages，还**包括操作行为记录，这一点和初级Agent仅仅持久化对话历史不一样**。
+
+详细说明见下面的 *SessionStorage 存储分析* 小节。
+
+（3）**三层架构**
+
+Session 子系统分为三层：
+
+```
+SessionRepo (管理多个 Session)
+    └── Session (对 SessionStorage 的薄封装，提供便捷的 CRUD 方法)
+           └── SessionStorage (底层持久化接口，定义实际的存储行为)
+```
+
+- `SessionStorage` 是**接口层**，定义了 `getLeafId`、`setLeafId`、`appendEntry`、`getEntry`、`getPathToRoot`、`getEntries` 等底层操作。
+- `Session` 是**薄封装层**，在 `SessionStorage` 之上提供 `appendMessage`、`appendModelChange`、`appendCompaction`、`moveTo`、`buildContext` 等语义化方法，本质上是对底层存储接口的 CRUD 封装，不包含复杂业务逻辑。
+- `SessionRepo` 是**仓库层**，管理多个 `Session` 实例的生命周期（创建、打开、列表、删除、fork）。
+
+（4）**延迟写入与 save point 机制**
+
+在 `AgentHarness` 的 turn 执行期间，会话写入不直接调用 `Session` 的方法，而是缓存在 `pendingSessionWrites` 队列中。这些写入在 `turn_end`（save point）或 `agent_end`（settlement）时批量刷新到 `Session`。这保证了会话状态的一致性——如果 turn 中途失败，未刷新的写入不会污染持久化状态。
+
+（5）**上下文重建（`buildContext`）**
+
+`buildSessionContext()` 从当前 leaf 沿 `parentId` 链回溯到根，重建 `AgentMessage[]` 和当前上下文状态（`thinkingLevel`、`model`、`activeToolNames`）。遇到 `compaction` 条目时，跳过被压缩的条目，只保留摘要消息和 `firstKeptEntryId` 之后的消息。
+
+（6）**两种存储后端**
+
+内置了如下两种实现，均实现 `SessionStorage` 接口：
+- `InMemorySessionStorage`: 测试用
+- `JsonlSessionStorage`: 生产用，追加式 JSONL 文件
+
+#### 2. Session 主要功能和使用
+
+| 功能 | 方法 | 说明 |
+|------|------|------|
+| **上下文重建** | `buildContext()` / `buildSessionContext()` | 从树形结构中重建 `AgentMessage[]` 和当前上下文 |
+| 消息追加 | `appendMessage()` | 追加对话消息（user/assistant/tool-result） |
+| 配置变更记录 | `appendModelChange()` / `appendThinkingLevelChange()` / `appendActiveToolsChange()` | 持久化模型、思考级别、工具集的变更 |
+| 上下文压缩 | `appendCompaction()` | 持久化压缩摘要，包含 `firstKeptEntryId` 用于后续上下文重建时跳过被压缩条目 |
+| **分支查询** | `getBranch(fromId?)` | 获取从根到指定（或当前）叶子的完整路径 |
+| **分支导航** | `moveTo(entryId, summary?)` | 跳转到会话树中的任意节点，可选附带分支摘要 |
+| 分支摘要 | `appendBranchSummary()` | 树导航时自动生成变更摘要 |
+| 标签 | `appendLabel()` | 为条目打标签（用于 UI 书签） |
+| 自定义条目 | `appendCustomEntry()` / `appendCustomMessageEntry()` | 扩展自定义条目类型 |
+| 会话信息 | `appendSessionName()` / `getSessionName()` | 会话名称管理 |
+| Fork 支持 | `SessionRepo.fork()` | 从某个会话的指定节点分叉出新的会话实例 |
+
+> 上面的API中，只有 `getBranch()` 和 `buildContext()` 方法比较重型，
+> 其他方法都只是简单的 append 一条对应操作类型的记录而已，包括 moveTo() 方法。
+> 个人感觉这也是 pi-agent-core Session 系统设计里最出彩的地方之一。
+
+在 `AgentHarness` 执行流程中的使用场景：
+
+- **`createTurnState()`** 时调用 `session.buildContext()` 从持久化状态重建消息上下文
+- **`message_end` 事件**时调用 `session.appendMessage()` 持久化消息
+- **`turn_end`（save point）** 时刷新 `pendingSessionWrites`（批量写入 model/thinking/tool 变更等）
+- **`compact()`** 时调用 `session.appendCompaction()` 持久化压缩摘要
+- **`navigateTree()`** 时调用 `session.moveTo()` 跳转分支
+- **idle 时的 config setter**（`setModel`、`setThinkingLevel`、`setActiveTools`）直接调用 session 的 append 方法立即持久化
+
+#### 3. SessionStorage 存储分析 - KEY
+
+（1）SessionStorage 中记录的行为是 11 种条目类型的联合，分为以下几类：
+
+- **对话类**（参与 `buildContext` 消息重建）：
+
+| 条目类型         | 记录内容                               | 触发场景                        |
+| ---------------- | -------------------------------------- | ------------------------------- |
+| `message`        | 对话消息（user/assistant/tool-result） | 每轮 LLM 交互产生的消息         |
+| `custom_message` | 自定义消息（可控 `display` 是否展示）  | 应用层注入的系统级消息          |
+| `branch_summary` | 分支跳转摘要                           | `navigateTree()` 跳转分支时生成 |
+
+- **配置变更类**（记录运行时状态变更，不产生 LLM 消息）：
+
+| 条目类型                | 记录内容                       | 触发场景                          |
+| ----------------------- | ------------------------------ | --------------------------------- |
+| `model_change`          | 模型切换（provider + modelId） | `setModel()`                      |
+| `thinking_level_change` | 思考级别变更                   | `setThinkingLevel()`              |
+| `active_tools_change`   | 活跃工具集变更                 | `setTools()` / `setActiveTools()` |
+
+- **压缩/结构类**：
+
+| 条目类型     | 记录内容                            | 触发场景                   |
+| ------------ | ----------------------------------- | -------------------------- |
+| `compaction` | 上下文压缩摘要 + `firstKeptEntryId` | `compact()`                |
+| `leaf`       | 当前分支叶子指针（`targetId`）      | `setLeafId()` / `moveTo()` |
+
+- **元数据/扩展类**：
+
+| 条目类型       | 记录内容         | 触发场景              |
+| -------------- | ---------------- | --------------------- |
+| `label`        | 给任意条目打标签 | `appendLabel()`       |
+| `custom`       | 自定义数据       | 应用层扩展            |
+| `session_info` | 会话名称         | `appendSessionName()` |
+
+关键点：**不是所有条目都参与 `buildContext` 的消息重建**：
+- `buildSessionContext()` 函数中，只有 `message`、`custom_message`、`branch_summary` 三种会被提取为 `AgentMessage[]`。
+- `model_change`、`thinking_level_change`、`active_tools_change` 仅用于推断当前上下文状态（当前用哪个模型、什么思考级别、哪些工具活跃），`compaction` 用于决定从哪条消息开始保留。
+
+（2）特殊条目
+
+- `LabelEntry`
+  - 它不挂在 `parentId` 链上作为树节点，而是通过 `targetId` **指向另一个已存在的条目**。
+  - 它的设计意图是**为会话树中的任意节点打书签/标签**，用于 UI 层展示（如 TUI 中的对话分支标记）。
+
+- `LeafEntry`
+  - 叶子节点项，它也不参与树结构构建，而是指向另一个Entry。
+  - 它**代表的不是当前叶子节点，而是表示一次导航跳转记录**！！！
+  - 它和 SessionStorage 的 `leafId` 属性关系密切。
+
+#### 4. Session、SessionStorage、SessionRepo 三者关系
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      SessionRepo                             │
+│  (管理多个 Session 的生命周期)                                 │
+│  - create(options) → Session                                 │
+│  - open(metadata) → Session                                  │
+│  - list() → SessionMetadata[]                                │
+│  - delete(metadata)                                          │
+│  - fork(source, options) → Session                           │
+├──────────────────────────────────────────────────────────────┤
+│  InMemorySessionRepo          │  JsonlSessionRepo            │
+│  (内存 Map，测试用)            │  (JSONL 文件系统，生产用)      │
+│  持有 Map<string, Session>    │  sessionsRoot 目录 + 子目录    │
+│  通过 InMemorySessionStorage  │  通过 JsonlSessionStorage     │
+│  创建 Session                 │  创建 Session                 │
+└──────────────┬───────────────┴──────────────┬────────────────┘
+               │                              │
+               ▼                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│                        Session                               │
+│  (对 SessionStorage 的薄封装，语义化 CRUD 方法)                │
+│  - buildContext() → SessionContext                           │
+│  - appendMessage / appendModelChange / ...                   │
+│  - moveTo(entryId, summary?) — 分支导航                       │
+│  - getBranch / getEntry / getLabel / ...                     │
+│  内部持有: SessionStorage 实例                                │
+├──────────────────────────────────────────────────────────────┤
+│  构造函数: constructor(storage: SessionStorage)               │
+│  所有方法均委托给 this.storage                                 │
+└──────────────┬───────────────────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    SessionStorage (接口)                     │
+│  定义底层持久化操作                                           │
+│  - getMetadata() → TMetadata                                 │
+│  - getLeafId / setLeafId(leafId)                             │
+│  - createEntryId() → string                                  │
+│  - appendEntry(entry)                                        │
+│  - getEntry(id) → SessionTreeEntry | undefined               │
+│  - findEntries(type) → SessionTreeEntry[]                    │
+│  - getLabel(id) → string | undefined                         │
+│  - getPathToRoot(leafId) → SessionTreeEntry[]                │
+│  - getEntries() → SessionTreeEntry[]                         │
+├──────────────────────────────────────────────────────────────┤
+│  InMemorySessionStorage       │  JsonlSessionStorage         │
+│  (内存数组+Map，测试用)        │  (追加式 JSONL 文件，生产用)   │
+│  entries: SessionTreeEntry[]  │  filePath: string            │
+│  byId: Map<id, entry>         │  entries + byId (内存缓存)    │
+│  labelsById: Map<id, label>   │  labelsById: Map<id, label>  │
+│  leafId: string | null        │  currentLeafId: string|null  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**关键关系总结**：
+
+> `SessionRepo`是留给调用`AgentHarness`的外部系统管理多个会话使用的，
+> `AgentHarness`本身不使用`SessionRepo`，而是使用`SessionRepo`里查询获取的`Session`。
+
+1. **`SessionRepo` 是工厂和注册中心**：它负责创建、打开、删除、列出、fork 多个 `Session`。
+  - 它拥有 `Session` 实例的所有权。
+  - `InMemorySessionRepo` 用 `Map<string, Session>` 管理，`JsonlSessionRepo` 用文件系统目录结构管理。
+
+2. **`Session` 是薄封装**：`Session` 类本身不包含存储逻辑，其构造函数接收一个 `SessionStorage` 实例，所有方法都是对底层 `SessionStorage` 接口的委托调用。
+  `Session` 的价值在于提供语义化的方法名（如 `appendMessage` 而非 `appendEntry`）和上下文重建逻辑（`buildContext` → `buildSessionContext`）。
+
+3. **`SessionStorage` 是真正的存储实现**：所有持久化逻辑都在 `SessionStorage` 的实现类中。
+  `InMemorySessionStorage` 和 `JsonlSessionStorage` 共享相同的内部数据结构（`entries` 数组、`byId` Map、`labelsById` Map、叶子 ID 追踪），但持久化方式不同——前者存内存，后者追加写入 JSONL 文件。
+
+4. **`toSession()` 是桥接函数**（`repo-utils.ts`）：`const session = new Session(storage)` 的简单工厂，Repo 层通过它把 `SessionStorage` 包装成 `Session`。
+
+5. **`leaf` 条目是关键设计**：`setLeafId()` 不是纯内存操作——它通过 `appendEntry` 持久化一条 `LeafEntry`，其 `targetId` 指向当前活跃叶子或 `null`（根节点）。`leafIdAfterEntry()` 函数定义了规则：普通条目将其 `id` 作为新叶子，`leaf` 条目则使用其 `targetId`。这确保了分支导航在存储重新打开后仍然有效。
 
 
 -------------------------------------------------------------

@@ -331,9 +331,14 @@ export interface Shell {
 /** Filesystem and process execution environment used by the harness. */
 export interface ExecutionEnv extends FileSystem, Shell {}
 
+/**
+ * 下面几个接口定义了 Session/SessionStorage 里存储的单条记录的格式，分为多种类型。
+ */
 export interface SessionTreeEntryBase {
+	// 单条记录的类型
 	type: string;
 	id: string;
+	// 指向上一条记录的ID
 	parentId: string | null;
 	timestamp: string;
 }
@@ -390,6 +395,8 @@ export interface CustomMessageEntry<T = unknown> extends SessionTreeEntryBase {
 	display: boolean;
 }
 
+// 这个记录类型比较特殊，它是一个元数据项目，不参与树形结构构建。
+// 旨在为其他 Entry 打标签，targetId 指向被 label 标记的 Entry。
 export interface LabelEntry extends SessionTreeEntryBase {
 	type: "label";
 	targetId: string;
@@ -401,6 +408,9 @@ export interface SessionInfoEntry extends SessionTreeEntryBase {
 	name?: string;
 }
 
+// 这个记录类型也特殊，它的名字具有误解性：它代表的不是当前叶子节点，而是表示一次导航跳转记录！！！
+// 它的 targetI 表示的时此次导航跳转行为指向的 SessionTreeEntry
+// 它是为了配合 SessionStorage 接口的 setLeafId() 方法，将该方法的行为持久化为一次记录。
 export interface LeafEntry extends SessionTreeEntryBase {
 	type: "leaf";
 	targetId: string | null;
@@ -437,6 +447,9 @@ export interface JsonlSessionMetadata extends SessionMetadata {
 	parentSessionPath?: string;
 }
 
+/**
+ * 定义Session底层存储的相关接口
+ */
 export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetadata> {
 	getMetadata(): Promise<TMetadata>;
 	getLeafId(): Promise<string | null>;
@@ -449,6 +462,7 @@ export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetad
 		type: TType,
 	): Promise<Array<Extract<SessionTreeEntry, { type: TType }>>>;
 	getLabel(id: string): Promise<string | undefined>;
+	// 这个方法最重要，它是实现会话跳转的关键 ------------------------------ KEY
 	getPathToRoot(leafId: string | null): Promise<SessionTreeEntry[]>;
 	getEntries(): Promise<SessionTreeEntry[]>;
 }
@@ -465,6 +479,9 @@ export interface SessionForkOptions {
 	id?: string;
 }
 
+/**
+ * 用于管理多个 Session 的仓库接口。
+ */
 export interface SessionRepo<
 	TMetadata extends SessionMetadata = SessionMetadata,
 	TCreateOptions extends SessionCreateOptions = SessionCreateOptions,

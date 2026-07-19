@@ -19,6 +19,12 @@ import type {
 } from "../types.ts";
 import { SessionError } from "../types.ts";
 
+/**
+ * 根据 Session 提供的 SessionTreeEntry 数组，重建 Context。
+ * 此方法非常重要，因为会话跳转、分支跳转、会话压缩 后的历史会话记录重建过程都被分离并推迟到这里执行了 ----------- KEY
+ * @param pathEntries 
+ * @returns 
+ */
 export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionContext {
 	let thinkingLevel = "off";
 	let model: { provider: string; modelId: string } | null = null;
@@ -35,10 +41,13 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 		} else if (entry.type === "active_tools_change") {
 			activeToolNames = [...entry.activeToolNames];
 		} else if (entry.type === "compaction") {
+			// 检查是否有会话压缩的操作 Entry ------------- KEY
 			compaction = entry;
 		}
 	}
 
+	// SessionTreeEntry 是一个联合类型，SessionStorage 中存储的不仅是message，还有其他一些行为类型
+	// 这里可以看出，不是所有的类型的 SessionTreeEntry 都会参与 AgentMessage 的重建。
 	const messages: AgentMessage[] = [];
 	const appendMessage = (entry: SessionTreeEntry) => {
 		if (entry.type === "message") {
@@ -59,6 +68,7 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 	};
 
 	if (compaction) {
+		// 如果在上面检测到有历史会话记录压缩的操作记录，就在这里进行压缩前的历史会话的清理操作
 		messages.push(createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp));
 		const compactionIdx = pathEntries.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
 		let foundFirstKept = false;
@@ -79,7 +89,26 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 	return { messages, thinkingLevel, model, activeToolNames };
 }
 
+/**
+ * 这个 Session 类只是对底层 SessionStorage接口 的CRUD操作的封装。
+ * 真正重要的逻辑在底层的 SessionStorage接口实现对象里。
+ * 
+ * 值得关注的2个方法如下，因为这两个方法比较重，会触发对底层sessionStorage的重组。
+ * - getBranch()
+ * - buildContext()
+ * 
+ * 其他的方法，都只是简单的 append 一条对应操作类型的记录而已，包括 moveTo() 方法。
+ * 
+ * 个人感觉这是 pi-agent-core 的 Session 设计最出彩的地方：
+ * - 存储的不仅是对话历史 Messages，还有各类操作的历史记录
+ * - 对于 compaction、对话跳转这类行为，也只是作为操作行为进行记录，而不记录操作结果本身
+ */
 export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
+	/**
+	 * pi-agent-core自带了两类 SessionStore接口实现：
+     * - memory-storage.ts 里的 InMemorySessionStorage
+	 * - jsonl-storage.ts 里的 JsonlSessionStorage
+	 */
 	private storage: SessionStorage<TMetadata>;
 
 	constructor(storage: SessionStorage<TMetadata>) {
@@ -106,6 +135,11 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		return this.storage.getEntries();
 	}
 
+	/**
+	 * 这个方法最重要，它是会话跳转、分支跳转的关键方法。
+	 * @param fromId 
+	 * @returns 
+	 */
 	async getBranch(fromId?: string): Promise<SessionTreeEntry[]> {
 		const leafId = fromId ?? (await this.storage.getLeafId());
 		return this.storage.getPathToRoot(leafId);
@@ -244,6 +278,13 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		} satisfies SessionInfoEntry);
 	}
 
+	/**
+	 * 表面上这个方法作为会话跳转，应该是一个重方法，但是实际上这里只是append一次分支跳转行为的记录而已，
+	 * 实际的分支跳转后的会话历史构建过程并不在这里。
+	 * @param entryId 
+	 * @param summary 
+	 * @returns 
+	 */
 	async moveTo(
 		entryId: string | null,
 		summary?: { summary: string; details?: unknown; fromHook?: boolean },

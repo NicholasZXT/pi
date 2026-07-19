@@ -110,11 +110,17 @@ export async function runAgentLoop(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 ): Promise<AgentMessage[]> {
+	// newMessage 本身是 prompts 的一个拷贝
 	const newMessages: AgentMessage[] = [...prompts];
+	// 这里重新构建了一个 AgentContext
 	const currentContext: AgentContext = {
 		...context,
+		// 将本次用户输入消息 prompts 追加到 context.messages 后，这里似乎重复了？
 		messages: [...context.messages, ...prompts],
 	};
+	// currentContext 是完整的上下文，在 runLoop() 里会被传递给模型
+	// newMessages 只是记录本次调用新增的消息，并在最后返回给用户
+	// 这两者职责不同，因此不算重复存储消息。
 
 	// 这里调用并异步等待部分 hook 方法执行完。
 	// emit 一般对应的就是 agent.ts 里 Agent.processEvents(signal) 方法。
@@ -127,6 +133,7 @@ export async function runAgentLoop(
 
 	// 实际的 AgentLoop 逻辑在这里
 	await runLoop(currentContext, newMessages, config, signal, emit, streamFn);
+	// 此处 newMessages 已经包含了本次调用的结果
 	return newMessages;
 }
 
@@ -205,6 +212,7 @@ async function runLoop(
 				for (const message of pendingMessages) {
 					await emit({ type: "message_start", message });
 					await emit({ type: "message_end", message });
+					// 这里同时向两个地方追加了新的 message ???
 					currentContext.messages.push(message);
 					newMessages.push(message);
 				}
@@ -213,6 +221,9 @@ async function runLoop(
 			}
 
 			// 触发对模型服务的流式请求
+			// 注意，这里只使用了 currentContext 里的 messages，没有使用 newMessages，
+			// 不过将返回的新消息加入了 newMessages 里
+			// 当然，这个新消息在方法内部也已经追加到 currentContext 里了
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
@@ -242,6 +253,7 @@ async function runLoop(
 
 				// 将工具调用结果加入messages列表和上下文
 				for (const result of toolResults) {
+					// 同时更新两个messages
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}

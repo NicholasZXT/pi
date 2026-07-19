@@ -2,7 +2,12 @@ import { type Session, SessionError, type SessionMetadata, type SessionRepo } fr
 import { InMemorySessionStorage } from "./memory-storage.ts";
 import { createSessionId, createTimestamp, getEntriesToFork, toSession } from "./repo-utils.ts";
 
+/**
+ * 管理多个 Session 的对象.
+ * 它不是为 HarnessAgent 准备的，而是为调用 HarnessAgent 的外部系统准备的。
+ */
 export class InMemorySessionRepo implements SessionRepo<SessionMetadata, { id?: string }, void> {
+	// 它持有一个管理多个 Session 的 Map
 	private sessions = new Map<string, Session<SessionMetadata>>();
 
 	async create(options: { id?: string } = {}): Promise<Session<SessionMetadata>> {

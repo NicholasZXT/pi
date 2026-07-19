@@ -74,6 +74,7 @@ export async function collectEntriesForBranchSummary(
 	}
 	const oldPath = new Set((await session.getBranch(oldLeafId)).map((e) => e.id));
 	const targetPath = await session.getBranch(targetId);
+	// 查询targetId 的会话历史 paths 中和旧会话历史共有的第一个祖先节点
 	let commonAncestorId: string | null = null;
 	for (let i = targetPath.length - 1; i >= 0; i--) {
 		if (oldPath.has(targetPath[i].id)) {
@@ -81,6 +82,7 @@ export async function collectEntriesForBranchSummary(
 			break;
 		}
 	}
+	// 从共有的第一个祖先节点开始收集共有的历史 paths Entry
 	const entries: SessionTreeEntry[] = [];
 	let current: string | null = oldLeafId;
 
