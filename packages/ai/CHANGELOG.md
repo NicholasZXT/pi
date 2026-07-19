@@ -45,7 +45,7 @@
 
 ## [0.80.0] - 2026-06-23
 
-### Breaking Changes
+### Breaking Changes {#v0.80.0-breaking-changes}
 
 - The root entrypoint (`@earendil-works/pi-ai`) is now core-only and side-effect free. The old global API moved to the temporary `@earendil-works/pi-ai/compat` entrypoint, a strict superset of the root: switching a file's import path is the only migration step. Moved symbols include `stream`/`complete`/`streamSimple`/`completeSimple`, `getModel`/`getModels`/`getProviders` (now deprecated aliases of `getBuiltinModel`/`getBuiltinModels`/`getBuiltinProviders` from `@earendil-works/pi-ai/providers/all`), `registerApiProvider`/`unregisterApiProviders`/`resetApiProviders`/`getApiProvider`, `getEnvApiKey`/`findEnvKeys`, `setBedrockProviderModule`, the per-API lazy stream wrappers (`anthropicMessagesApi`, ...), and the image-generation API.
 - Renamed the `Provider` type to `ProviderId`. `Provider` now names the runtime provider interface (id, name, auth, model listing, stream behavior).

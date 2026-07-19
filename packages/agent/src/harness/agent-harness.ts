@@ -154,12 +154,18 @@ interface AgentHarnessTurnState<
 	activeTools: TTool[];
 }
 
+/**
+ * AgentHarness 类.
+ * 它和 agent.ts 里的 Agent 类没有关系，而是直接基于 agent-loop.ts 里的 runAgentLoop() 函数实现了一套逻辑。
+ */
 export class AgentHarness<
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
 	TTool extends AgentTool = AgentTool,
 > {
+	// 执行环境封装
 	readonly env: ExecutionEnv;
+	// Session对象
 	private session: Session;
 	readonly models: Models;
 	private phase: AgentHarnessPhase = "idle";
@@ -311,14 +317,25 @@ export class AgentHarness<
 		};
 	}
 
+	/**
+	 * 每轮对话开始时构建当前轮次的 context state
+	 * @returns 
+	 */
 	private async createTurnState(): Promise<AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>> {
+		// 构建当前上下文
 		const context = await this.session.buildContext();
+		// 加载 skills / prompts 等资源
 		const resources = this.getResources();
+		// 获取当前session的元数据
 		const sessionMetadata = await this.session.getMetadata();
+
+		// 获取可使用的工具描述 + 当前活跃的工具描述
 		const tools = [...this.tools.values()];
 		const activeTools = this.activeToolNames
 			.map((name) => this.tools.get(name))
 			.filter((tool): tool is TTool => tool !== undefined);
+
+		// 最基本的系统提示词，可以被替换掉：直接字符串设置替换或者从环境里加载。
 		let systemPrompt = "You are a helpful assistant.";
 		if (typeof this.systemPrompt === "string") {
 			systemPrompt = this.systemPrompt;
@@ -332,6 +349,7 @@ export class AgentHarness<
 				resources,
 			});
 		}
+
 		return {
 			messages: context.messages,
 			resources,
@@ -528,6 +546,15 @@ export class AgentHarness<
 		return [failureMessage];
 	}
 
+	/**
+	 * AgentHarness 执行的核心方法。
+	 * 底层的 AgentLoop 是基于 agent-loop.ts 提供的 runAgentLoop() 方法，
+	 * 因此这个类重点要关注的应该是它围绕着 AgentLoop 做了哪些上下文相关的 Harness 工程。
+	 * @param turnState 
+	 * @param text 
+	 * @param options 
+	 * @returns 
+	 */
 	private async executeTurn(
 		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
 		text: string,
@@ -560,8 +587,11 @@ export class AgentHarness<
 			activeTurnState = nextTurnState;
 		};
 		this.runAbortController = abortController;
+
+		// ---------------------------------------------------------------------------------------------
 		const runResultPromise = (async () => {
 			try {
+				// 直接调用底层 agent-loop.ts 的 runAgentLoop() 方法 ---------------------------- KEY
 				return await runAgentLoop(
 					messages,
 					this.createContext(turnState, beforeResult?.systemPrompt),
@@ -587,6 +617,8 @@ export class AgentHarness<
 				}
 			}
 		})();
+		// ---------------------------------------------------------------------------------------------
+
 		try {
 			const newMessages = await runResultPromise;
 			for (let i = newMessages.length - 1; i >= 0; i--) {
@@ -605,6 +637,7 @@ export class AgentHarness<
 		}
 	}
 
+	// 主要的使用入口方法
 	async prompt(text: string, options?: { images?: ImageContent[] }): Promise<AssistantMessage> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
 		this.phase = "turn";

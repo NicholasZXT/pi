@@ -12,6 +12,12 @@
 - providers/deepseek.ts，看一个模型的示例即可
 - api/openai-completions.ts
 
+可以结合下面两个官方项目文档，了解pi-ai的使用方式和设计思路：
+- [pi-ai:README.md](../packages/ai/README.md): 使用方式
+- [pi-agent-core:docs/models.md](../packages/agent/docs/models.md): 设计思路
+
+另外，pi-ai的models使用在 v0.80.0 版本经历了一次 Breaking Changes，
+参考文档 [pi-ai:CHANGELOG.md](../packages/ai/CHANGELOG.md#v0.80.0-breaking-changes).
 
 ------------------------------------------------------------
 # Pi Agent Core 源码分析
@@ -60,27 +66,27 @@ src/index.ts
   │                 │
   │                 │  ┌── 外层循环: 处理 follow-up 消息 ──────────────────┐
   │                 │  │                                                  │
-  │                 │  │  ┌── 内层循环: 处理 tool calls + steering ────┐  │
-  │                 │  │  │                                            │  │
-  │                 │  │  │  1. 注入 pending steering/follow-up 消息   │  │
-  │                 │  │  │  2. streamAssistantResponse() → LLM 调用   │  │
-  │                 │  │  │  3. executeToolCalls() → 工具执行          │  │
-  │                 │  │  │     ├─ sequential: 逐个执行                 │  │
-  │                 │  │  │     └─ parallel: 并发执行                   │  │
-  │                 │  │  │  4. emit turn_end                          │  │
-  │                 │  │  │  5. prepareNextTurn() → 刷新会话状态       │  │
+  │                 │  │  ┌── 内层循环: 处理 tool calls + steering ────┐   │
+  │                 │  │  │                                           │   │
+  │                 │  │  │  1. 注入 pending steering/follow-up 消息   │   │
+  │                 │  │  │  2. streamAssistantResponse() → LLM 调用   │   │
+  │                 │  │  │  3. executeToolCalls() → 工具执行          │   │
+  │                 │  │  │     ├─ sequential: 逐个执行                │   │
+  │                 │  │  │     └─ parallel: 并发执行                  │   │
+  │                 │  │  │  4. emit turn_end                         │   │
+  │                 │  │  │  5. prepareNextTurn() → 刷新会话状态       │   │
   │                 │  │  │  6. shouldStopAfterTurn()? → 退出          │  │
   │                 │  │  │  7. getSteeringMessages() → 下一轮         │  │
   │                 │  │  └────────────────────────────────────────────┘  │
   │                 │  │                                                  │
-  │                 │  │  8. getFollowUpMessages() → 有则继续外层循环     │
+  │                 │  │  8. getFollowUpMessages() → 有则继续外层循环       │
   │                 │  └──────────────────────────────────────────────────┘
   │                 │
   │                 └─► emit agent_end
   │
   └─► AgentHarness.prompt(text)             [harness/agent-harness.ts]
-        └─► createTurnState() → 从 Session 构建上下文
-        └─► executeTurn() → 调用 runAgentLoop()
+        └─► createTurnState() → 从 Session 构建 Turn Snapshot
+        └─► executeTurn() → 直接调用 runAgentLoop()（不经过 Agent 类）
               └─► handleAgentEvent() → 事件处理 + 会话持久化
 ```
 
@@ -90,42 +96,46 @@ src/index.ts
 
 ### 2.1 分层架构
 
+`AgentHarness` 和 `Agent` 是**两条并行的上层路径**，它们都基于底层的 `agent-loop.ts` 和 `pi-ai`：
+
 ```
-┌──────────────────────────────────────────────────────┐
-│                  AgentHarness                         │
-│  会话管理 · 上下文压缩 · 钩子系统 · Skills · 模板      │
-│  (harness/agent-harness.ts)                          │
-├──────────────────────────────────────────────────────┤
-│                     Agent                             │
-│  有状态封装 · 事件订阅 · 消息队列(steer/followUp)      │
-│  (agent.ts)                                          │
-├──────────────────────────────────────────────────────┤
-│              低级 Agent 循环 (无状态)                  │
-│  runAgentLoop / runLoop / streamAssistantResponse     │
-│  executeToolCalls (sequential | parallel)             │
-│  (agent-loop.ts)                                     │
-├──────────────────────────────────────────────────────┤
-│                  pi-ai (LLM API)                      │
-│  streamSimple · Model · Transport · Message           │
-│  (packages/ai)                                       │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────┐  ┌──────────────────────────────┐
+│       AgentHarness       │  │           Agent              │
+│  会话管理 · 压缩 · 钩子   │  │  状态封装 · 事件订阅 · 队列    │
+│  (harness/agent-harness) │  │  (agent.ts)                  │
+│  直接调用 runAgentLoop()  │  │  调用 runAgentLoop()         │
+└──────────┬───────────────┘  └──────────────┬───────────────┘
+           │                                 │
+           └───────────┬─────────────────────┘
+                       │
+           ┌───────────▼────────────────────────────┐
+           │       低级 Agent 循环 (无状态)          │
+           │  runAgentLoop / runLoop                │
+           │  streamAssistantResponse               │
+           │  executeToolCalls (sequential|parallel)│
+           │  (agent-loop.ts)                       │
+           ├────────────────────────────────────────┤
+           │          pi-ai (LLM API)               │
+           │  streamSimple · Model · Message        │
+           │  (packages/ai)                         │
+           └────────────────────────────────────────┘
 ```
 
 ### 2.2 核心设计原则
 
-1. **关注点分离**：低级循环（`agent-loop.ts`）是无状态的纯函数，`Agent` 类在其上添加状态管理和事件系统，`AgentHarness` 再添加会话持久化和钩子。
+1. **关注点分离**：低级循环（`agent-loop.ts`）是无状态的纯函数。`Agent` 类和 `AgentHarness` 是两条独立的上层路径——`Agent` 类在循环之上添加有状态封装和事件系统，`AgentHarness` 则在循环之上添加会话持久化、钩子、压缩等基础设施。`AgentHarness` 不依赖 `Agent` 类，而是直接调用 `runAgentLoop()`。
 
 2. **AgentMessage 抽象**：所有消息使用 `AgentMessage`（`Message | CustomAgentMessages[keyof CustomAgentMessages]`），在 LLM 调用边界通过 `convertToLlm()` 转换为标准 `Message[]`。应用可通过 TypeScript 声明合并扩展自定义消息类型。
 
 3. **事件驱动**：Agent 循环通过 `AgentEvent` 联合类型发出生命周期事件（`agent_start/end`、`turn_start/end`、`message_start/update/end`、`tool_execution_start/update/end`），UI 层通过 `subscribe()` 监听。
 
-4. **消息队列系统**：支持两种队列——
+4. **消息队列系统**：支持两种队列
    - **Steering Queue**：在当前 assistant turn 完成后立即注入（用于中途干预）
    - **Follow-up Queue**：仅在 Agent 即将停止时注入（用于追加任务）
    - 每种队列支持 `"all"`（一次全部排出）和 `"one-at-a-time"`（每次排出一个）模式
 
 5. **工具执行策略**：
-   - `"sequential"`：逐个准备→执行→完成
+   - `"sequential"`：逐个准备 → 执行 → 完成
    - `"parallel"`：顺序准备，然后并发执行，按完成顺序发出 `tool_execution_end`，按 assistant 源码顺序发出 tool-result 消息
 
 ---
@@ -142,7 +152,9 @@ src/index.ts
 
 ### 3.2 循环详细逻辑
 
-#### 3.2.1 入口：`runAgentLoop` (agent-loop.ts:95-115)
+#### 3.2.1 入口：`runAgentLoop`
+
+agent-loop.ts:95-115
 
 ```typescript
 async function runAgentLoop(prompts, context, config, emit, signal, streamFn) {
@@ -152,7 +164,9 @@ async function runAgentLoop(prompts, context, config, emit, signal, streamFn) {
 }
 ```
 
-#### 3.2.2 核心：`runLoop` (agent-loop.ts:148-270)
+#### 3.2.2 核心：`runLoop`
+
+agent-loop.ts:148-270
 
 双层循环结构：
 
@@ -209,7 +223,7 @@ emitToolExecutionEnd() → createToolResultMessage() → emitToolResultMessage()
 | `beforeToolCall` | 工具执行前钩子，可 block |
 | `afterToolCall` | 工具执行后钩子，可覆盖结果 |
 | `prepareNextTurn` | 每轮结束后更新 context/model/thinkingLevel |
-| `shouldStopAfterTurn` | 判断是否应停止 |
+| `shouldStopAfterTurn` | 每轮结束后判断是否应停止当前对话 |
 | `getSteeringMessages` | 获取中途 steering 消息 |
 | `getFollowUpMessages` | 获取 follow-up 消息 |
 | `toolExecution` | `"sequential"` 或 `"parallel"` |
@@ -218,7 +232,15 @@ emitToolExecutionEnd() → createToolResultMessage() → emitToolResultMessage()
 
 ## 四、Agent Harness 工程实现
 
-### 4.1 涉及的核心源码文件
+> [设计文档](../packages/agent/docs/agent-harness.md): `packages/agent/docs/agent-harness.md`
+
+### 4.1 与 Agent 类的关系
+
+**AgentHarness 不依赖 Agent 类**。它直接调用 `agent-loop.ts` 中的 `runAgentLoop()` 函数。这与 `Agent` 类形成两条平行的上层路径，各自基于底层循环构建不同的抽象。
+
+`Agent` 类面向有状态封装（事件订阅、消息队列、state 管理），`AgentHarness` 面向会话持久化、钩子系统、上下文压缩等基础设施。
+
+### 4.2 核心源码文件概览
 
 | 文件 | 职责 |
 |------|------|
@@ -242,12 +264,41 @@ emitToolExecutionEnd() → createToolResultMessage() → emitToolResultMessage()
 | `src/harness/utils/shell-output.ts` | Shell 输出处理 |
 | `src/harness/utils/truncate.ts` | 文本截断工具 |
 
-### 4.2 AgentHarness 架构
+### 4.3 状态模型 (State Model)
 
-`AgentHarness` 是比 `Agent` 更高层的抽象，为 `pi-coding-agent` 等应用提供完整的 Agent 运行时基础设施：
+设计文档将 AgentHarness 的状态分为**四类**，这是理解其设计的核心：
+
+| 类别 | 说明 | 生命周期 |
+|------|------|---------|
+| **Harness Config** | 最新运行时配置（model、thinkingLevel、tools、activeToolNames、resources、streamOptions、systemPrompt）。getter 返回最新值，不是 in-flight 快照。setter 立即更新，影响下一轮 turn snapshot。 | 持久的，跨 turn |
+| **Turn Snapshot** | 每轮 LLM 调用时由 `createTurnState()` 创建的快照。包含：持久化 session messages、解析后的 resources、systemPrompt、model、thinkingLevel、activeTools、streamOptions、sessionId。该轮所有逻辑使用同一快照。 | 每轮新建 |
+| **Session** | 仅持久化的条目（通过 `SessionStorage` 存储）。不包含 pending writes。读取返回已持久化状态。 | 持久化 |
+| **Pending Session Writes** | busy 期间排队的 session 写入。基于 session-entry 形状但无生成字段（`id`、`parentId`、`timestamp`）。在 save point 或 operation settlement 时刷新。 | 排队，随后刷新 |
+
+### 4.4 操作阶段 (Operation Phases)
+
+```typescript
+type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry";
+```
+
+**结构性操作**（需要 `phase === "idle"`，否则抛出 `AgentHarnessError("busy")`）：
+- `prompt()`、`skill()`、`promptFromTemplate()`
+- `compact()`、`navigateTree()`
+
+**Turn 期间允许的操作**：
+- `steer()`、`followUp()`、`nextTurn()`、`abort()`
+- 运行时 config setter（`setModel()`、`setThinkingLevel()`、`setTools()` 等）
+
+### 4.5 AgentHarness 架构
 
 ```
 AgentHarness
+├── 状态模型
+│   ├── Harness Config — 最新运行时配置，getter/setter 立即生效
+│   ├── Turn Snapshot — createTurnState() 创建，每轮快照
+│   ├── Session — 仅持久化条目，不包含 pending writes
+│   └── Pending Session Writes — busy 期间排队，save point 刷新
+│
 ├── 会话管理 (Session)
 │   ├── 树形会话结构 (parentId 链表)
 │   ├── 多种条目类型: message, model_change, thinking_level_change,
@@ -267,66 +318,100 @@ AgentHarness
 │   └── generateBranchSummary() — 生成分支变更摘要
 │
 ├── 钩子系统 (Hooks)
+│   ├── subscribe() — 通配符订阅，接收所有事件（observational）
+│   ├── on() — 按事件类型注册，可返回结果（mutation hooks）
 │   ├── before_agent_start — 修改 prompt / systemPrompt
 │   ├── context — 修改发送给 LLM 的消息
-│   ├── before_provider_request — 修改 stream options
+│   ├── before_provider_request — 修改 stream options（支持链式 patch）
 │   ├── before_provider_payload — 修改请求 payload
 │   ├── after_provider_response — 观察响应
 │   ├── tool_call — 可 block 工具调用
-│   ├── tool_result — 可覆盖工具结果
-│   ├── session_before_compact — 压缩前拦截
+│   ├── tool_result — 可覆盖结果（content/details/isError/terminate）
+│   ├── session_before_compact — 压缩前拦截（可取消或提供自定义摘要）
 │   ├── session_compact — 压缩后通知
-│   ├── session_before_tree — 树导航前拦截
+│   ├── session_before_tree — 树导航前拦截（可取消）
 │   └── session_tree — 树导航后通知
 │
 ├── 资源管理
-│   ├── Skills — SKILL.md 加载与格式化
-│   └── Prompt Templates — .md 模板加载与格式化
+│   ├── Skills — 通过 setResources() 注入，system prompt 回调中格式化
+│   └── Prompt Templates — 通过 setResources() 注入，promptFromTemplate() 使用
 │
 └── 执行环境抽象 (ExecutionEnv)
     ├── FileSystem — 平台无关的文件操作
     └── Shell — 平台无关的命令执行
 ```
 
-### 4.3 AgentHarness 执行流程
+### 4.6 AgentHarness 执行流程
 
 ```
 AgentHarness.prompt(text)
   │
-  ├─ 1. 检查 phase === "idle"
+  ├─ 1. 检查 phase === "idle"（否则抛出 "busy"）
   ├─ 2. 设置 phase = "turn"
-  ├─ 3. createTurnState()
-  │     ├─ session.buildContext() → 从会话树重建消息
-  │     ├─ 构建 systemPrompt（字符串或回调）
-  │     ├─ 解析 activeTools
-  │     └─ 返回 AgentHarnessTurnState
+  ├─ 3. createTurnState() — 创建 Turn Snapshot
+  │     ├─ session.buildContext() → 从会话树重建消息（含 compaction 处理）
+  │     ├─ getResources() → 获取 skills / promptTemplates（浅拷贝）
+  │     ├─ 解析 activeTools（从 activeToolNames 映射到实际 tool 对象）
+  │     ├─ 构建 systemPrompt：
+  │     │   ├─ 如果是字符串 → 直接使用
+  │     │   └─ 如果是回调 → 调用并传入 { env, session, model, thinkingLevel, activeTools, resources }
+  │     └─ 返回 AgentHarnessTurnState（包含 messages, resources, streamOptions, sessionId, systemPrompt, model, thinkingLevel, tools, activeTools）
   │
   ├─ 4. executeTurn(turnState, text)
-  │     ├─ 处理 nextTurnQueue 中的排队消息
-  │     ├─ emitHook("before_agent_start") → 可修改 prompt/systemPrompt
-  │     ├─ 创建 AbortController
-  │     ├─ 调用 runAgentLoop()
-  │     │     ├─ createContext() → AgentContext
-  │     │     ├─ createLoopConfig() → AgentLoopConfig
-  │     │     │     ├─ convertToLlm (来自 messages.ts)
+  │     ├─ 处理 nextTurnQueue 中的排队消息（插入到用户消息之前）
+  │     ├─ emitHook("before_agent_start") → 可修改 messages[] 和 systemPrompt
+  │     ├─ 创建 AbortController（赋值给 runAbortController）
+  │     ├─ 直接调用 runAgentLoop()（不经过 Agent 类）
+  │     │     ├─ createContext(turnState, overrideSystemPrompt?) → AgentContext
+  │     │     ├─ createLoopConfig(getTurnState, setTurnState) → AgentLoopConfig
+  │     │     │     ├─ convertToLlm: 来自 harness/messages.ts
   │     │     │     ├─ transformContext → emitHook("context")
   │     │     │     ├─ beforeToolCall → emitHook("tool_call")
   │     │     │     ├─ afterToolCall → emitHook("tool_result")
-  │     │     │     ├─ prepareNextTurn → flushPendingSessionWrites + createTurnState
-  │     │     │     ├─ getSteeringMessages → drainQueuedMessages(steerQueue)
-  │     │     │     └─ getFollowUpMessages → drainQueuedMessages(followUpQueue)
-  │     │     ├─ handleAgentEvent() → 事件处理 + 会话持久化
-  │     │     └─ createStreamFn() → 包装 models.streamSimple
-  │     │           ├─ emitHook("before_provider_request")
-  │     │           ├─ onPayload → emitHook("before_provider_payload")
-  │     │           └─ onResponse → emitHook("after_provider_response")
+  │     │     │     ├─ prepareNextTurn → flushPendingSessionWrites() + createTurnState()
+  │     │     │     │     └─ 创建新的 Turn Snapshot，更新 activeTurnState
+  │     │     │     ├─ getSteeringMessages → drainQueuedMessages(steerQueue, steeringQueueMode)
+  │     │     │     │     └─ 支持 "all" 或 "one-at-a-time" 排出模式
+  │     │     │     │     └─ emitQueueUpdate() 失败时回滚已排出的消息
+  │     │     │     └─ getFollowUpMessages → drainQueuedMessages(followUpQueue, followUpQueueMode)
+  │     │     ├─ handleAgentEvent(event, signal) → 事件处理 + 会话持久化
+  │     │     │     ├─ message_end → session.appendMessage() + emitAny()
+  │     │     │     ├─ turn_end → emitAny() + flushPendingSessionWrites() + emitOwn("save_point")
+  │     │     │     └─ agent_end → flushPendingSessionWrites() + phase="idle" + emitAny() + emitOwn("settled")
+  │     │     └─ createStreamFn(getTurnState) → 包装 models.streamSimple
+  │     │           ├─ emitBeforeProviderRequest(model, sessionId, streamOptions)
+  │     │           │     └─ 链式调用多个 before_provider_request 钩子，合并 streamOptions patch
+  │     │           ├─ onPayload → emitBeforeProviderPayload(model, payload)
+  │     │           └─ onResponse → emitOwn("after_provider_response")
   │     │
-  │     └─ 返回最后一个 AssistantMessage
+  │     └─ 从 newMessages 中提取最后一个 AssistantMessage 返回
   │
-  └─ 5. finishRunPromise() → phase = "idle"
+  └─ 5. finishRunPromise() → runPromise 变为 undefined
 ```
 
-### 4.4 会话模型
+### 4.7 Save Points（保存点）
+
+Save point 发生在 assistant turn 及其 tool-result 消息完成后（`turn_end` 事件处理中）：
+
+1. 先通知订阅者（`emitAny`），然后刷新 pending session writes
+2. 如果循环继续，`prepareNextTurn` 回调会：
+   - 刷新 pending session writes
+   - 调用 `createTurnState()` 创建新的 Turn Snapshot
+   - 更新 `activeTurnState`，使下一轮 LLM 调用使用新配置
+3. 发出 `save_point` 事件（含 `hadPendingMutations` 标志）
+
+这确保了 model、thinkingLevel、tools、resources、streamOptions 的变更在 turn 期间不会影响当前 in-flight 请求，但会在下一轮生效。
+
+### 4.8 Abort 语义
+
+- `abort()` 在 turn 期间允许，不在 idle 时使用
+- 调用 `runAbortController.abort()` 取消底层循环
+- **清除** steering 和 followUp 队列
+- **不清除** `nextTurnQueue`（消息在下一次用户发起的 turn 中插入到用户消息之前）
+- **不丢弃** pending session writes（在下一个 save point 或 `agent_end` 时刷新）
+- 返回 `{ clearedSteer, clearedFollowUp }`
+
+### 4.9 会话模型
 
 会话采用**树形结构**，每个条目通过 `parentId` 链接到父节点：
 
@@ -342,12 +427,14 @@ SessionTreeEntry 类型:
 ├── custom_message    — 自定义消息（可控制是否显示）
 ├── label             — 标签（用于 UI 书签）
 ├── session_info      — 会话名称
-└── leaf              — 当前分支叶子指针
+└── leaf              — 当前分支叶子指针（持久化为 entry，非纯内存游标）
 ```
 
 `buildContext()` 从当前 leaf 沿 `parentId` 链回溯到根，重建 `AgentMessage[]`。遇到 `compaction` 条目时，只保留摘要消息和 `firstKeptEntryId` 之后的消息。
 
-### 4.5 上下文压缩 (Compaction)
+`setLeafId()` 不是纯内存操作——它持久化一条 `leaf` entry，其 `targetId` 为当前活跃叶子或 `null`（根节点）。重新打开存储时必须从最新的 leaf-affecting entry 重建当前叶子。
+
+### 4.10 上下文压缩 (Compaction)
 
 压缩流程：
 
@@ -359,7 +446,15 @@ SessionTreeEntry 类型:
    - 调用 LLM 生成结构化摘要
 4. 摘要作为 `compaction` 条目持久化，后续 `buildContext()` 自动使用
 
-### 4.6 关键设计特点
+### 4.11 错误处理
+
+- **低层能力**（`ExecutionEnv`、文件系统、Shell、资源加载、compaction 辅助函数）：使用 `Result<T, E>` 模式，不抛异常
+- **高层变更/编排 API**（`Session`、`AgentHarness`）：reject/throw，不返回可忽略的 bare result
+- 公共 harness 失败被规范化为 `AgentHarnessError`；子系统错误保留为 `cause`
+- 钩子/订阅者失败在 commit 之后：状态变更不回滚，公共方法 reject 并带 `AgentHarnessError("hook")`
+- Queue drain 失败时消息回滚（`drainQueuedMessages` 在 `emitQueueUpdate` 失败后 `unshift` 回去）
+
+### 4.12 关键设计特点
 
 1. **平台无关的执行环境**：`ExecutionEnv` 接口抽象了文件系统和 Shell，`NodeExecutionEnv` 是 Node.js 实现。这使得 harness 可以在浏览器、沙箱等不同环境中运行。
 
@@ -369,10 +464,18 @@ SessionTreeEntry 类型:
 
 4. **泛型扩展**：`AgentHarness<TSkill, TPromptTemplate, TTool>` 使用泛型参数，允许应用层使用更具体的 Skill/PromptTemplate/Tool 类型。
 
-5. **钩子链**：多个同类型钩子按注册顺序依次执行，后续钩子可覆盖前一个的结果（如 `before_provider_request` 的 streamOptions 合并）。
+5. **钩子链**：多个同类型钩子按注册顺序依次执行，后续钩子可覆盖前一个的结果（如 `before_provider_request` 的 streamOptions 合并，支持 key 级别删除）。
+
+6. **直接调用 runAgentLoop**：AgentHarness 不通过 `Agent` 类，而是直接调用 `agent-loop.ts` 的 `runAgentLoop()`。它自己管理 run 生命周期、abort controller、queue draining、provider stream config、event reduction、session persistence、pending write flushing 和 save-point snapshots。
+
+7. **Config 与 Snapshot 分离**：getter 返回最新 harness config，不是 in-flight 快照。setter 立即更新 config，影响下一次 `createTurnState()`。Turn Snapshot 一旦创建就不可变，保证该轮 LLM 调用的一致性。
 
 
-------------------------------------------------------------
+## 五、组件细节讨论
+
+
+
+-------------------------------------------------------------
 # Pi Coding Agent 源码分析
 
 > 包名: `@earendil-works/pi-coding-agent` | CLI 命令: `pi`
@@ -631,7 +734,7 @@ core/session-manager.ts                  harness/session/session.ts
 
 
 -----------------------
-# 细节讨论
+# 其他讨论
 
 ## Skill 加载
 
@@ -667,5 +770,5 @@ Skills 加载在项目中有**两套独立实现**，分别位于两个子项目
 
 ### 在流程中的位置
 
-- **AgentHarness 路径**：`harness/skills.ts` 被 `harness/agent-harness.ts` 在 `createTurnState()` 中通过 `emitHook("before_agent_start")` 间接引用，然后 `harness/system-prompt.ts` 将 skill 列表注入 system prompt
+- **AgentHarness 路径**：Skills 通过 `setResources()` 由应用层注入到 `AgentHarness.resources`。在 `createTurnState()` 中通过 `getResources()` 获取后传给 system prompt 回调（或 `formatSkillsForSystemPrompt()`），最终注入 system prompt。`before_agent_start` 钩子在 `executeTurn()` 中发出，可进一步修改 prompt 和 systemPrompt。
 - **pi-coding-agent 路径**：`core/resource-loader.ts`（`DefaultResourceLoader`）在 `reload()` 时调用 `core/skills.ts` 加载 skills，随后 `core/system-prompt.ts` 的 `buildSystemPrompt()` 将它们注入系统提示词
