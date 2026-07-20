@@ -686,46 +686,62 @@ SessionRepo (管理多个 Session)
 
 pi-coding-agent 是一个交互式编程 Agent CLI 工具，提供三种运行模式（交互式 TUI、单次 print、JSON-RPC）。
 
-其架构遵循**关注点分离**原则，分为四层：
+其架构遵循**关注点分离**原则，分为五层（自上而下，上层依赖下层）：
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │                   运行模式 (modes/)                       │
 │  InteractiveMode (TUI)  │  PrintMode  │  RpcMode         │
 │  使用 pi-tui 渲染界面    │  单次文本输出 │  JSON-RPC 协议   │
-├─────────────────────────────────────────────────────────┤
-│               AgentSession (core/agent-session.ts)       │
-│  会话生命周期 · 事件封装 · 压缩 · Bash执行 · 模型切换      │
-│  ExtensionRunner 集成 · 自动重试                          │
-├─────────────────────────────────────────────────────────┤
-│          AgentSessionRuntime (agent-session-runtime.ts)   │
-│  运行时管理 · Session 切换/分支/fork · 服务生命周期         │
-├─────────────────────────────────────────────────────────┤
+│  还有 RpcClient 用于编程式调用                             │
+├──────────────────────────────────────────────────────────┤
+│        AgentSessionRuntime (agent-session-runtime.ts)    │
+│  运行时管理 · Session 切换/分支/fork/replace · 服务生命周期 │
+│  createRuntime() 工厂闭包模式 (捕获 CLI 参数)              │
+├──────────────────────────────────────────────────────────┤
+│  AgentSessionServices (agent-session-services.ts)        │
+│  cwd 绑定的基础设施服务工厂:                               │
+│  createAgentSessionServices() / createAgentSessionFromServices() │
+│  SettingsManager · AuthStorage · ModelRegistry ·         │
+│  ResourceLoader · ExtensionRunner                        │
+├──────────────────────────────────────────────────────────┤
 │              SDK (core/sdk.ts)                           │
-│  createAgentSession() · Agent 实例化 · 工具工厂            │
-│  Model 解析 · Auth 管理 · convertToLlm                    │
-├─────────────────────────────────────────────────────────┤
-│                pi-agent-core (Agent)                      │
-│  Agent 类 · runAgentLoop · AgentMessage · AgentTool       │
+│  ★ 核心编排器: createAgentSession()                      │
+│  Agent 实例化 · AgentSession 创建 · 工具工厂               │
+│  Model 解析 · Auth 管理 · convertToLlm · streamFn 包装    │
+├──────────────────────────────────────────────────────────┤
+│               AgentSession (core/agent-session.ts)       │
+│  会话生命周期 · 事件封装 · 压缩 · Bash执行 · 模型切换       │
+│  ExtensionRunner 集成 · 自动重试                          │
+│  包装 pi-agent-core 的 Agent 类                           │
+├──────────────────────────────────────────────────────────┤
+│                pi-agent-core (Agent)                     │
+│  Agent 类 · runAgentLoop · AgentMessage · AgentTool      │
 │  (packages/agent)                                        │
-├─────────────────────────────────────────────────────────┤
-│                pi-ai (LLM API)                            │
+├──────────────────────────────────────────────────────────┤
+│                pi-ai (LLM API)                           │
 │  streamSimple · Model · Message                          │
 │  (packages/ai)                                           │
-└─────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 ```
+
+> **关键依赖关系**：`agent-session-services.ts` 调用 `sdk.ts` 的 `createAgentSession()`，`sdk.ts` 创建 `Agent`（pi-agent-core）并包装为 `AgentSession`。因此 **SDK 是底层编排器**，`AgentSessionServices` 在其之上提供 cwd 绑定的服务工厂。`main.ts` 通过 `createAgentSessionRuntime()` 工厂闭包将这一切串联起来。
 
 核心设计特点：
 
-1. **模式无关的核心抽象**：`AgentSession` 是所有运行模式共享的核心类，封装了 Agent 生命周期、会话持久化、压缩、Bash 执行等。各模式只负责 I/O 层。
+1. **模式无关的核心抽象**：`AgentSession` 是所有运行模式共享的核心类，封装了 Agent 生命周期、会话持久化、压缩、Bash 执行等。各模式只负责 I/O 层。各模式通过 `AgentSessionRuntime` 访问 `AgentSession`，`AgentSessionRuntime` 负责会话的创建、替换（切换到不同项目）、fork、分支导航等生命周期管理。
 
-2. **自建基础设施（非 AgentHarness）**：pi-coding-agent **没有使用** `pi-agent-core` 中的 `AgentHarness`。它在 `Agent` 类之上构建了自己的并行基础设施——自己的会话管理（`SessionManager`）、自己的压缩系统（`core/compaction/`）、自己的消息类型（`core/messages.ts`）、自己的扩展系统（`core/extensions/`）、自己的系统提示词构建器（`core/system-prompt.ts`）。
+2. **cwd 绑定的服务层**：`AgentSessionServices` 是工作目录绑定的基础设施服务集合。当切换项目 cwd 时（如 `--session` 指定了不同项目的会话），这些服务会随 `createRuntime` 工厂闭包重建。这种设计确保了扩展、技能、设置等资源始终与当前工作目录一致。
 
-3. **扩展系统**：通过 `ExtensionRunner` 管理第三方扩展的生命周期，扩展可注册工具、订阅事件、注册 slash 命令、键盘快捷键。
+3. **自建基础设施（非 AgentHarness）**：pi-coding-agent **没有使用** `pi-agent-core` 中的 `AgentHarness`。它在 `Agent` 类之上构建了自己的并行基础设施——自己的会话管理（`SessionManager`，同样使用 parentId 树形结构 + JSONL 文件）、自己的压缩系统（`core/compaction/`）、自己的消息类型（`core/messages.ts`）、自己的扩展系统（`core/extensions/`）、自己的系统提示词构建器（`core/system-prompt.ts`）。
 
-4. **工具工厂模式**：所有内置工具（read、bash、edit、write、grep、find、ls）通过工厂函数创建（如 `createReadToolDefinition(cwd, options)`），支持自定义 cwd 和配置。
+4. **扩展系统**：通过 `ExtensionRunner` 管理第三方扩展的生命周期，扩展可注册工具、订阅事件、注册 slash 命令、键盘快捷键。扩展系统与 `AgentSession` 深度集成，通过 `agent.beforeToolCall` / `agent.afterToolCall` 钩子拦截工具调用。
 
-5. **会话持久化**：使用 JSONL 文件存储会话历史，支持会话的分支（fork）、摘要（compact）、树导航（navigateTree）。
+5. **工具工厂模式**：所有内置工具（read、bash、edit、write、grep、find、ls）通过工厂函数创建（如 `createReadTool(cwd, options)`），支持自定义 cwd 和配置。`sdk.ts` 导出了工具创建函数供外部 SDK 消费者使用。
+
+6. **会话持久化**：使用 JSONL 文件存储会话历史，底层通过 `parentId` 形成树形结构，支持会话的分支（fork）、摘要（compact）、树导航（navigateTree）。与 `pi-agent-core` 的 Session 系统一样，条目类型不仅包含对话消息，还包含配置变更（model_change、thinking_level_change）、压缩（compaction）、分支摘要（branch_summary）等操作记录。
+
+7. **`createRuntime` 工厂闭包模式**：`main.ts` 中定义了一个 `CreateAgentSessionRuntimeFactory` 类型的闭包，它捕获所有 CLI 参数（`--model`、`--tools`、`--extensions` 等），当需要切换 cwd 时（如 `--session` 指向不同项目），该闭包会被重新调用，以新 cwd 重建所有服务。这是 `AgentSessionRuntime` 的核心设计。
 
 ---
 ## 二、执行模式
@@ -736,6 +752,45 @@ pi-coding-agent 是一个交互式编程 Agent CLI 工具，提供三种运行�
 | **Print (text)** | `modes/print-mode.ts` | `pi -p "prompt"` | 单次执行，输出最终 assistant 响应文本 |
 | **Print (json)** | `modes/print-mode.ts` | `pi --mode json "prompt"` | 单次执行，输出 JSON 事件流 |
 | **RPC** | `modes/rpc/rpc-mode.ts` | `pi --mode rpc` | Headless 模式，通过 stdin/stdout 的 JSON 协议通信 |
+| **RPC Client** | `modes/rpc/rpc-client.ts` | 编程式调用 | `RpcClient` 类，封装子进程 spawn + JSON-RPC，提供 `start()`/`prompt()`/`stop()` 等编程接口 |
+
+### 2.1 三种模式对比
+
+| 维度 | **InteractiveMode** | **PrintMode** | **RpcMode** |
+|------|---------------------|---------------|-------------|
+| **触发条件** | 默认 (TTY 环境) | `-p "prompt"` / `--mode json` / 管道输入 | `--mode rpc` |
+| **I/O 方式** | pi-tui 全屏终端 UI | stdout 文本 / JSON 事件流 | stdin/stdout JSON 协议 |
+| **生命周期** | 持续运行，等待用户输入 | 单次执行后退出 | 持续运行，等待 JSON 命令 |
+| **UI 组件** | 完整 TUI (编辑器/消息列表/状态栏) | 无 UI | 无 UI (通过 JSON 事件通信) |
+| **扩展 UI** | 支持对话框/选择器/小组件 | 不支持 | 通过 JSON 协议代理 |
+| **会话持久化** | 默认持久化到 JSONL 文件 | 取决于 `--no-session` | 取决于客户端命令 |
+| **核心类** | `InteractiveMode` | `runPrintMode()` | `runRpcMode()` + `RpcClient` |
+
+### 2.2 InteractiveMode TUI 结构
+
+`InteractiveMode` 使用 `pi-tui` 构建终端 UI，结构如下：
+
+```
+┌──────────────────────────────────────────┐
+│  Startup Header (快捷键/扩展/技能列表)     │
+├──────────────────────────────────────────┤
+│  Messages (用户消息/助手回复/工具调用)     │
+│  ├── UserMessageComponent                │
+│  ├── AssistantMessageComponent           │
+│  ├── ToolExecutionComponent              │
+│  ├── BashExecutionComponent              │
+│  ├── CompactionSummaryMessageComponent   │
+│  └── BranchSummaryMessageComponent       │
+├──────────────────────────────────────────┤
+│  Editor (输入区域，支持 @自动补全/Tab)     │
+│  ├── CustomEditor (默认)                 │
+│  └── ExtensionEditorComponent (扩展)     │
+├──────────────────────────────────────────┤
+│  Footer (cwd/会话名/token/模型/成本)      │
+└──────────────────────────────────────────┘
+```
+
+它监听 `AgentSession` 事件，将每种事件类型映射到对应的 TUI Component。
 
 ---
 ## 三、整体执行流程
@@ -746,6 +801,8 @@ pi-coding-agent 是一个交互式编程 Agent CLI 工具，提供三种运行�
 cli.ts (Node.js 入口)
   │
   ├─ 设置 process.title / PI_CODING_AGENT 环境变量
+  ├─ 禁用 process.emitWarning（减少终端噪音）
+  ├─ configureHttpDispatcher() → 配置全局 HTTP 调度器
   └─ main(process.argv.slice(2))
 
 main.ts
@@ -753,6 +810,11 @@ main.ts
   ├─ Phase 1: 参数解析 & 初始化
   │   ├─ parseArgs(args) → 解析 CLI 参数
   │   ├─ resolveAppMode() → 确定模式 (interactive/print/rpc/json)
+  │   │   ├─ --mode rpc          → "rpc"
+  │   │   ├─ --mode json         → "json"
+  │   │   ├─ -p / 非TTY输入      → "print"
+  │   │   └─ 默认                → "interactive"
+  │   ├─ 特殊命令处理 (--version / --export / pi config / pi update)
   │   ├─ resolveProjectTrusted() → 项目信任检查
   │   ├─ runMigrations(cwd) → 运行数据迁移
   │   └─ createSessionManager() → 创建/恢复/分支会话
@@ -761,61 +823,88 @@ main.ts
   │       ├─ 分支: SessionManager.forkFrom() / --fork
   │       └─ 内存: SessionManager.inMemory() / --no-session
   │
-  ├─ Phase 2: 创建运行时服务
-  │   └─ createAgentSessionServices(cwd, agentDir, ...)
-  │       ├─ AuthStorage.create(auth.json)
-  │       ├─ ModelRegistry.create(models.json)
-  │       ├─ SettingsManager.create(cwd, agentDir)
-  │       └─ DefaultResourceLoader 加载:
-  │           ├─ Skills (SKILL.md)
-  │           ├─ Prompt Templates (.md)
-  │           ├─ Extensions (TS 模块)
-  │           └─ Context files (AGENTS.md, etc.)
-  │
-  ├─ Phase 3: 解析模型 & Session 选项
-  │   ├─ resolveCliModel() → 解析 --model / --provider
-  │   ├─ buildSessionOptions() → 构建 CreateAgentSessionOptions
-  │   └─ createAgentSessionRuntime() → 创建完整运行时
-  │       └─ createAgentSession() [sdk.ts]
-  │           ├─ 创建 Agent 实例
+  ├─ Phase 2: 创建运行时 (核心：createRuntime 工厂闭包)
+  │   │
+  │   │  ★ main.ts 的核心设计模式：createRuntime 是一个闭包，
+  │   │    捕获所有 CLI 参数 (--model, --tools, --extensions 等)，
+  │   │    当需要切换 cwd 时 (如 --session 指向不同项目)，
+  │   │    该闭包被重新调用，以新 cwd 重建所有服务。
+  │   │
+  │   ├─ Step 2a: createAgentSessionServices(cwd, agentDir, ...)
+  │   │   ├─ SettingsManager.create(cwd, agentDir) → 项目设置
+  │   │   ├─ AuthStorage.create(auth.json) → 认证存储
+  │   │   ├─ ModelRegistry.create(authStorage, models.json) → 模型注册表
+  │   │   └─ DefaultResourceLoader.reload() → 加载扩展资源:
+  │   │       ├─ Extensions (TS 模块 → ExtensionRunner)
+  │   │       ├─ Skills (SKILL.md)
+  │   │       ├─ Prompt Templates (.md)
+  │   │       ├─ Themes
+  │   │       └─ Context files (AGENTS.md, etc.)
+  │   │
+  │   ├─ Step 2b: resolveModelScope() → 解析 --models 参数
+  │   │
+  │   ├─ Step 2c: buildSessionOptions() → 构建 CreateAgentSessionOptions
+  │   │   ├─ 解析 --model / --provider / --thinking
+  │   │   ├─ 解析 --tools / --no-tools / --exclude-tools
+  │   │   └─ 解析 --api-key
+  │   │
+  │   └─ Step 2d: createAgentSessionFromServices(services, ...)
+  │       └─ 内部调用 createAgentSession() [sdk.ts]
+  │           ├─ 恢复/选择模型 (从会话恢复 or findInitialModel)
+  │           ├─ 创建 Agent 实例 (pi-agent-core)
   │           │   ├─ initialState: { systemPrompt, model, thinkingLevel, tools }
-  │           │   ├─ convertToLlm: 自定义转换（含 blockImages）
-  │           │   ├─ streamFn: 包装 streamSimple（注入 auth、headers、retry）
+  │           │   ├─ convertToLlm: convertToLlmWithBlockImages
+  │           │   ├─ streamFn: 包装 streamSimple (注入 auth/headers/retry)
   │           │   ├─ transformContext: 通过 ExtensionRunner 修改上下文
+  │           │   ├─ onPayload / onResponse: 扩展 provider 钩子
   │           │   ├─ steeringMode / followUpMode / transport / thinkingBudgets
   │           │   └─ sessionId: 会话 UUID
   │           └─ 创建 AgentSession(agent, sessionManager, ...)
+  │               ├─ 订阅 agent 事件 → _handleAgentEvent (持久化/压缩/扩展转发)
+  │               ├─ _installAgentToolHooks() → beforeToolCall/afterToolCall
+  │               ├─ _installAgentNextTurnRefresh() → 每轮刷新 system prompt
+  │               └─ _buildRuntime() → 构建工具注册表
+  │
+  ├─ Phase 3: createAgentSessionRuntime(factory)
+  │   └─ 创建 AgentSessionRuntime 实例
+  │       ├─ 持有 AgentSession 和 AgentSessionServices
+  │       ├─ 提供 newSession() / fork() / switchSession() / replace()
+  │       └─ setRebindSession() → 模式层重绑定回调
   │
   ├─ Phase 4: 运行对应模式
   │   │
   │   ├─ Print/JSON 模式:
-  │   │   ├─ 注册 Signale 处理器 (SIGTERM/SIGHUP)
+  │   │   ├─ 注册 Signal 处理器 (SIGTERM/SIGHUP)
   │   │   ├─ bindExtensions({ mode, commandContextActions })
   │   │   ├─ prepareInitialMessage() → 处理 @file 和 stdin
   │   │   ├─ session.prompt(message, { images })
-  │   │   │     └─ agent.prompt(userMessage)
+  │   │   │     └─ agent.prompt(userMessage) / agent.steer() / agent.followUp()
   │   │   │           └─ runAgentLoop() [agent-loop.ts]
   │   │   │                 └─ runLoop() (双层循环)
   │   │   └─ 监听 AgentSessionEvent → 输出最终结果
+  │   │       ├─ text 模式: 输出最后一条 assistant 消息的文本内容
+  │   │       └─ json 模式: 输出所有事件 (JSON 流)
   │   │
   │   ├─ Interactive 模式:
   │   │   ├─ initTheme() → 加载 TUI 主题
-  │   │   ├─ 创建 InteractiveMode(agentSession, runtime, options)
-  │   │   │     ├─ 构建 TUI 组件树
+  │   │   ├─ 创建 InteractiveMode(runtime, options)
+  │   │   │     ├─ 构建 TUI 组件树 (消息/编辑器/状态栏/Footer)
   │   │   │     ├─ 注册 slash 命令
   │   │   │     ├─ 绑定扩展 UI 上下文
   │   │   │     └─ 注册键盘快捷键
   │   │   └─ interactiveMode.run()
-  │   │         └─ TUI.processInput() → 事件循环
+  │   │         └─ TUI 事件循环 → 处理用户输入
   │   │
   │   └─ RPC 模式:
-  │       ├─ takeOverStdout()
-  │       ├─ 监听 stdin JSON 命令
-  │       └─ 输出 JSON 事件流到 stdout
+  │       ├─ takeOverStdout() → 接管 stdout
+  │       ├─ 监听 stdin JSON 命令 (prompt/steer/abort/switch_session/...)
+  │       ├─ 输出 JSON 事件流到 stdout
+  │       └─ 支持扩展 UI 代理 (extension_ui_request/response)
   │
   └─ Phase 5: 清理
       ├─ killTrackedDetachedChildren()
-      └─ runtimeHost.dispose() / stopThemeWatcher()
+      ├─ runtimeHost.dispose() → session.dispose()
+      └─ stopThemeWatcher() / restoreStdout()
 ```
 
 ---
@@ -823,7 +912,8 @@ main.ts
 
 ### 4.1 不使用 AgentHarness
 
-**pi-coding-agent 没有使用 `AgentHarness`**。在 `packages/coding-agent/src/` 中搜索 `AgentHarness` 返回零结果。
+**pi-coding-agent 没有使用 `AgentHarness`**。
+在 `packages/coding-agent/src/` 中搜索 `AgentHarness` 返回零结果。
 
 pi-coding-agent 直接从 `@earendil-works/pi-agent-core` 导入的核心 API：
 
@@ -875,12 +965,46 @@ agent = new Agent({
 
 `AgentSession` 包装 `Agent`，提供以下增强：
 
-- **事件转发**：订阅 `agent.subscribe()` 的内部事件，转换为 `AgentSessionEvent` 并转发给模式层
+- **事件转发**：订阅 `agent.subscribe()` 的内部事件，先转发给 `ExtensionRunner`（扩展钩子），再通过 `AgentSessionEvent` 转发给模式层监听器。详见下方 4.10 节。
 - **工具钩子**：在 `agent.beforeToolCall` / `agent.afterToolCall` 上安装 `ExtensionRunner` 的 `tool_call` / `tool_result` 钩子
-- **Turn 刷新**：通过 `agent.prepareNextTurnWithContext` 每轮刷新 system prompt 和 tools
+- **Turn 刷新**：通过 `agent.prepareNextTurnWithContext` 每轮刷新 system prompt（从 `_systemPromptOverride` 或 `_baseSystemPrompt`）和 tools
 - **自动压缩**：监听 `message_end` 事件，当 token 使用量超过阈值时自动触发 compact
-- **自动重试**：捕获 `agent_end`（stopReason="error"），可自动重试
-- **Bash 执行**：通过 `executeBashWithOperations` 包装 bash 工具调用
+- **自动重试**：捕获 `agent_end`（stopReason="error"），检查 `retry` 设置后自动重试
+- **Bash 执行**：通过 `executeBashWithOperations` 包装 bash 工具调用，支持 bash 消息的延迟刷新
+- **模型切换**：`cycleModel()` 在 scoped models 或所有可用模型间循环
+- **会话导航**：`navigateTree()` 支持在会话树中跳转到任意节点
+- **会话持久化**：`AgentSession` 在 `message_end` 事件中直接通过 `SessionManager` 持久化消息，无需 AgentHarness 的 pending writes 队列
+
+### 4.3.1 AgentSessionRuntime 详解 (agent-session-runtime.ts)
+
+`AgentSessionRuntime` 是 `AgentSession` 和 `AgentSessionServices` 的持有者，负责会话的生命周期管理：
+
+```
+AgentSessionRuntime
+├── 持有状态
+│   ├── _session: AgentSession       ← 当前活跃会话
+│   ├── _services: AgentSessionServices ← 当前 cwd 绑定的服务
+│   ├── createRuntime: CreateAgentSessionRuntimeFactory ← 工厂闭包
+│   └── _diagnostics: AgentSessionRuntimeDiagnostic[] ← 启动诊断
+│
+├── 会话操作方法
+│   ├── newSession(options) → 创建新会话 (替换当前)
+│   ├── fork(entryId, options) → 从指定节点 fork
+│   ├── switchSession(sessionPath, options) → 切换到不同会话
+│   ├── replace(sessionManager, options) → 替换底层 SessionManager
+│   └── dispose() → 清理当前会话资源
+│
+├── cwd 切换流程
+│   └── replace() / switchSession() / fork()
+│       └─ 调用 createRuntime({ cwd, agentDir, sessionManager, ... })
+│           └─ 重新创建 AgentSessionServices (新 cwd)
+│           └─ 重新创建 AgentSession (新模型/设置/扩展)
+│
+└── setRebindSession(fn)
+    └─ 模式层设置回调，在会话替换后重新绑定事件监听
+```
+
+`createRuntime` 工厂闭包是 `main.ts` 中定义的核心设计元素。它捕获 CLI 参数（`--model`、`--tools`、`--extensions` 等），当 cwd 改变时被重新调用以重建所有 cwd 绑定的服务。这使得 `AgentSessionRuntime` 可以无缝支持跨项目会话切换。
 
 ### 4.4 自建的并行基础设施
 
@@ -900,13 +1024,15 @@ pi-coding-agent 在 `Agent` 类之上构建了自己的基础设施层，与 `pi
 
 选择不使用 `AgentHarness` 而自建基础设施的可能原因：
 
-1. **不同的会话模型**：`AgentHarness` 的 Session 是树形结构（parentId 链表），而 pi-coding-agent 使用扁平的 JSONL 追加写入模型。树形结构更适合分支/合并场景。
+1. **扩展系统的独立性**：pi-coding-agent 的扩展系统（`ExtensionRunner`）是独立设计的，需要与 Extension SDK、slash commands、键盘快捷键、TUI 组件等深度集成，不适合直接映射到 AgentHarness 的钩子系统。
 
-2. **扩展系统的独立性**：pi-coding-agent 的扩展系统（`ExtensionRunner`）是独立设计的，需要与 Extension SDK、slash commands、键盘快捷键等深度集成，不适合直接映射到 AgentHarness 的钩子系统。
+2. **演进路径**：从代码结构看，`AgentHarness` 可能是后期设计的通用化抽象，而 pi-coding-agent 在更早版本就已存在。两套系统当前并行存在，未来可能逐步统一。
 
-3. **演进路径**：从代码结构看，`AgentHarness` 可能是后期设计的通用化抽象，而 pi-coding-agent 在更早版本就已存在。两套系统当前并行存在，未来可能逐步统一。
+3. **关注点不同**：`AgentHarness` 面向的是通用 agent 运行时（跨平台 FileSystem/Shell 抽象、钩子链、Result 类型错误处理），而 pi-coding-agent 是专为编程场景设计的 CLI 工具，需要更贴近 Node.js 生态和 TUI 交互。
 
-4. **关注点**：`AgentHarness` 面向的是通用 agent 运行时（跨平台 FileSystem/Shell 抽象），而 pi-coding-agent 是专为编程场景设计的 CLI 工具，需要更贴近 Node.js 生态。
+4. **会话模型独立实现**：虽然 pi-coding-agent 的 `SessionManager` 和 pi-agent-core 的 Session 系统**都使用 parentId 树形结构 + JSONL 文件**，但两者是独立实现的。pi-coding-agent 的 `buildSessionContext()` 与 pi-agent-core 的 `buildContext()` 在逻辑上几乎一致——都是从当前叶子沿 parentId 回溯到根、处理 compaction 跳过、提取 model/thinkingLevel 配置变更。它们共享相同的设计理念，但代码是独立的。
+
+> **修正**：之前文档错误地认为 pi-coding-agent 使用"扁平的 JSONL 追加写入模型"，但源码中 `session-manager.ts` 同样定义了 `parentId` 字段，`buildSessionContext()` 同样执行从叶子到根的树遍历，`getChildren()` 和 `getBranch()` 方法也证实了树形结构。与 pi-agent-core 的 Session 系统一样，条目类型不仅包含对话消息，还包含配置变更、压缩、分支摘要等操作记录。
 
 ### 4.6 关键共享代码
 
@@ -930,11 +1056,210 @@ core/messages.ts::convertToLlm()         harness/messages.ts::convertToLlm()
   └─ 通过声明合并扩展 CustomAgentMessages   └─ 通过声明合并扩展 CustomAgentMessages
 
 core/session-manager.ts                  harness/session/session.ts
-  (扁平 JSONL 文件)                       (树形 parentId 链表)
+  (parentId 树形结构 + JSONL 文件)        (parentId 树形结构 + JSONL 文件)
+  └─ buildSessionContext()                └─ buildContext()
+     独立实现，但逻辑原理一致:                 从叶子沿 parentId 回溯到根
+     从叶子沿 parentId 回溯到根              处理 compaction 跳过
+     处理 compaction 跳过                    提取 model/thinkingLevel 配置
+     提取 model/thinkingLevel 配置
 ```
 
+### 4.7 组件依赖关系总图
 
------------------------
+```mermaid
+graph TB
+    subgraph "外部依赖"
+        AI_LIB["pi-ai<br/>LLM API / 模型定义 / 流式调用"]
+        AGENT_LIB["pi-agent-core<br/>Agent 类 / AgentLoop / 类型定义"]
+        TUI_LIB["pi-tui<br/>终端 UI 组件库"]
+    end
+
+    subgraph "pi-coding-agent 核心层"
+        SDK["sdk.ts<br/>createAgentSession()"]
+        SERVICES["agent-session-services.ts<br/>createAgentSessionServices()<br/>createAgentSessionFromServices()"]
+        RUNTIME["agent-session-runtime.ts<br/>AgentSessionRuntime<br/>createAgentSessionRuntime()"]
+        SESSION["agent-session.ts<br/>AgentSession"]
+        EXT_SYS["extensions/<br/>ExtensionRunner / 类型 / 加载"]
+        TOOLS["tools/<br/>read/bash/edit/write/grep/find/ls"]
+        COMPACT["compaction/<br/>上下文压缩 / 分支摘要"]
+        SESSION_MGR["session-manager.ts<br/>会话持久化 (parentId 树形 + JSONL)"]
+        SETTINGS["settings-manager.ts<br/>设置管理"]
+        MODEL_REG["model-registry.ts<br/>模型注册 / API Key"]
+        AUTH["auth-storage.ts<br/>认证存储"]
+        RESOURCE["resource-loader.ts<br/>资源加载 (技能/提示词/主题/扩展)"]
+    end
+
+    subgraph "pi-coding-agent 模式层"
+        INTERACTIVE["InteractiveMode<br/>TUI 交互"]
+        PRINT["runPrintMode<br/>单次输出"]
+        RPC_MODE["runRpcMode<br/>JSON-RPC 服务端"]
+        RPC_CLIENT["RpcClient<br/>JSON-RPC 客户端"]
+    end
+
+    subgraph "pi-coding-agent CLI 层"
+        CLI_ENTRY["cli.ts"]
+        MAIN_ENTRY["main.ts"]
+        ARGS["cli/args.ts"]
+    end
+
+    %% 外部依赖
+    SESSION --> AGENT_LIB
+    TOOLS --> AGENT_LIB
+    SDK --> AGENT_LIB
+    SDK --> AI_LIB
+    INTERACTIVE --> TUI_LIB
+    EXT_SYS --> TUI_LIB
+
+    %% 核心层内部依赖
+    SDK --> SESSION
+    SDK --> TOOLS
+    SDK --> MODEL_REG
+    SDK --> AUTH
+    SDK --> SETTINGS
+    SDK --> SESSION_MGR
+    SDK --> RESOURCE
+
+    SERVICES --> SDK
+    SERVICES --> SETTINGS
+    SERVICES --> AUTH
+    SERVICES --> MODEL_REG
+    SERVICES --> RESOURCE
+
+    RUNTIME --> SESSION
+    RUNTIME --> SERVICES
+    RUNTIME --> SESSION_MGR
+
+    SESSION --> EXT_SYS
+    SESSION --> TOOLS
+    SESSION --> COMPACT
+    SESSION --> SESSION_MGR
+    SESSION --> SETTINGS
+    SESSION --> MODEL_REG
+    SESSION --> RESOURCE
+
+    %% 模式层依赖
+    INTERACTIVE --> RUNTIME
+    INTERACTIVE --> SESSION
+    PRINT --> RUNTIME
+    PRINT --> SESSION
+    RPC_MODE --> RUNTIME
+    RPC_MODE --> SESSION
+    RPC_CLIENT --> RPC_MODE
+
+    %% CLI 层依赖
+    CLI_ENTRY --> MAIN_ENTRY
+    MAIN_ENTRY --> SDK
+    MAIN_ENTRY --> RUNTIME
+    MAIN_ENTRY --> INTERACTIVE
+    MAIN_ENTRY --> PRINT
+    MAIN_ENTRY --> RPC_MODE
+    MAIN_ENTRY --> ARGS
+```
+
+### 4.8 关键依赖关系表
+
+| 组件 | 依赖 | 被依赖 |
+|------|------|--------|
+| **`pi-ai`** | 无 | `pi-agent-core`, `pi-coding-agent` (直接引用模型类型和流式 API) |
+| **`pi-agent-core`** | `pi-ai` | `AgentSession` (包装 `Agent`), `tools/` (引用 `AgentTool` 类型) |
+| **`pi-tui`** | 无 | `InteractiveMode` (TUI 渲染), `extensions/` (UI 组件类型) |
+| **`AgentSession`** | `Agent`, `ExtensionRunner`, `SessionManager`, `SettingsManager`, `ModelRegistry`, `ResourceLoader`, `tools/`, `compaction/` | `sdk.ts`, `AgentSessionRuntime`, 所有 Mode |
+| **`sdk.ts`** | `AgentSession`, `tools/`, `ModelRegistry`, `AuthStorage`, `SettingsManager`, `SessionManager`, `ResourceLoader` | `agent-session-services.ts`, `main.ts` |
+| **`AgentSessionServices`** | `sdk.ts`, `SettingsManager`, `AuthStorage`, `ModelRegistry`, `ResourceLoader` | `AgentSessionRuntime` |
+| **`AgentSessionRuntime`** | `AgentSession`, `AgentSessionServices`, `SessionManager` | `main.ts`, 所有 Mode |
+| **`InteractiveMode`** | `AgentSessionRuntime`, `AgentSession`, `pi-tui`, `extensions/` | `main.ts` |
+| **`runPrintMode`** | `AgentSessionRuntime` | `main.ts` |
+| **`runRpcMode`** | `AgentSessionRuntime` | `main.ts` |
+| **`RpcClient`** | 子进程 (spawn `runRpcMode`) | 外部 SDK 消费者 |
+
+### 4.9 AgentSession.prompt() 完整流程
+
+`AgentSession.prompt()` 是模式层与 Agent 交互的核心入口，它比 `Agent.prompt()` 多了多层处理：
+
+```
+AgentSession.prompt(text, options)
+  │
+  ├─ 1. 扩展命令处理 (如果 text 以 "/" 开头)
+  │     └─ _tryExecuteExtensionCommand(text) → 扩展自己管理 LLM 交互
+  │        如果扩展处理了命令，直接 return (不发送 prompt)
+  │
+  ├─ 2. 扩展输入拦截 (input 事件)
+  │     └─ ExtensionRunner.emitInput(text, images, source, streamingBehavior)
+  │        ├─ action === "handled" → return (扩展已处理)
+  │        └─ action === "transform" → 替换 text/images
+  │
+  ├─ 3. 技能/提示词模板展开
+  │     ├─ _expandSkillCommand() → /skill:name args → <skill> XML 块
+  │     └─ expandPromptTemplate() → /templatename → 模板内容
+  │
+  ├─ 4. 流式处理检测
+  │     ├─ 如果正在流式处理 (isStreaming):
+  │     │   ├─ streamingBehavior === "followUp" → agent.followUp()
+  │     │   └─ streamingBehavior === "steer" → agent.steer()
+  │     └─ 如果不在流式处理: 继续
+  │
+  ├─ 5. 验证模型和认证
+  │     ├─ 检查 model 是否存在
+  │     └─ 检查 modelRegistry.hasConfiguredAuth(model)
+  │
+  ├─ 6. 检查是否需要压缩 (前置检查)
+  │     └─ _checkCompaction(lastAssistantMessage, false)
+  │
+  ├─ 7. 构建消息数组
+  │     ├─ 用户消息 (text + images)
+  │     ├─ 注入 pendingNextTurnMessages (扩展排队消息)
+  │     └─ 注入 bash 执行消息 (_flushPendingBashMessages)
+  │
+  ├─ 8. 扩展 before_agent_start 事件
+  │     └─ ExtensionRunner.emitBeforeAgentStart(text, images, systemPrompt, options)
+  │        可注入自定义消息 (custom messages)
+  │
+  ├─ 9. 刷新 Bash 消息 (再次)
+  │     └─ _flushPendingBashMessages()
+  │
+  ├─ 10. 运行 AgentLoop
+  │      └─ agent.prompt(messages)
+  │            └─ runAgentLoop() → runLoop() (双层循环)
+  │                  ├─ 内层: steering + tool_calls
+  │                  └─ 外层: follow_up 消息
+  │
+  └─ 11. 扩展 after_agent_start 事件 (agent_start 后)
+```
+
+### 4.10 AgentSession 对 Agent 的事件处理
+
+`AgentSession` 构造函数中订阅了 `Agent` 的内部事件，`_handleAgentEvent` 是核心的事件处理中枢：
+
+```
+agent.subscribe(_handleAgentEvent)
+  │
+  ├─ message_start (user 消息)
+  │   └─ 从 steering/followUp 队列中移除对应消息 (UI 更新)
+  │
+  ├─ 所有事件
+  │   ├─ 先转发给 ExtensionRunner (_emitExtensionEvent)
+  │   │   ├─ agent_start → 扩展的 agent_start 事件
+  │   │   ├─ agent_end → 扩展的 agent_end 事件
+  │   │   ├─ turn_start → 扩展的 turn_start 事件 (含 turnIndex)
+  │   │   ├─ turn_end → 扩展的 turn_end 事件
+  │   │   ├─ message_start/update/end → 扩展的消息事件
+  │   │   └─ tool_execution_start/update/end → 扩展的工具事件
+  │   │
+  │   └─ 转发给模式层监听器 (_emit)
+  │       └─ 各模式通过 session.subscribe() 接收 AgentSessionEvent
+  │
+  ├─ message_end
+  │   ├─ 持久化到 SessionManager
+  │   │   ├─ custom 消息 → appendCustomMessageEntry()
+  │   │   └─ user/assistant/toolResult → appendMessage()
+  │   └─ 追踪 assistant 消息 (用于自动压缩和重试)
+  │
+  └─ agent_end
+      └─ 检查是否需要自动重试 (_willRetryAfterAgentEnd)
+          ├─ 检查 retry 设置 (enabled + maxRetries)
+          ├─ 检查是否为可重试错误 (_isRetryableError)
+          └─ 自动重试 → agent.continue()
+```
 # 其他讨论
 
 ## Skill 加载
